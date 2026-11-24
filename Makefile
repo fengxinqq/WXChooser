@@ -3,8 +3,6 @@ export ARCHS = arm64e
 export THEOS_PACKAGE_SCHEME = roothide
 export INSTALL_TARGET_PROCESSES = SpringBoard
 
-$(shell mkdir -p layout/Library/MobileSubstrate/DynamicLibraries && cp WXChooser_filter.plist layout/Library/MobileSubstrate/DynamicLibraries/WXChooser.plist)
-
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = WXChooser
@@ -13,6 +11,14 @@ WXChooser_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function 
 WXChooser_FRAMEWORKS = UIKit Foundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk
+
+TOOL_NAME = wxchooseropen
+wxchooseropen_FILES = wxchooseropen_main.m
+wxchooseropen_FRAMEWORKS = Foundation
+wxchooseropen_INSTALL_PATH = /var/mobile/wxchooser
+wxchooseropen_CODESIGN_FLAGS = -Swxchooseropen.entitlements
+
+include $(THEOS_MAKE_PATH)/tool.mk
 
 after-install::
 	install.exec "killall -9 SpringBoard"

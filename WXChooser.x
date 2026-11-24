@@ -3,6 +3,9 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
+#import <spawn.h>
+#import <sys/stat.h>
+#import <unistd.h>
 
 static NSString *const kWXLogPath = @"/var/mobile/wxchooser.log";
 
@@ -611,30 +614,39 @@ static void WXSetGuard(BOOL on) {
 static BOOL (*o_router_openURL)(id, SEL, NSURL *) = NULL;
 static BOOL (*o_router_openSensitive)(id, SEL, NSURL *) = NULL;
 
+// 不再在 SpringBoard 进程里直接调 SBS（那会就地崩溃）。改为写命令文件 + 拉起独立启动器进程执行。
 static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
     @try {
-        WXLoadSBS();
         if (!bid.length) return NO;
         gWXBusy = YES;
-        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 4.0;
-        BOOL ok = NO;
-        if (gSBSLaunchWithURL) {
-            CFStringRef err = NULL;
-            int r = gSBSLaunchWithURL((__bridge CFStringRef)bid, (__bridge CFURLRef)url,
-                                      (__bridge CFDictionaryRef)@{}, &err, false);
-            WXLOG(@"SB 启动 %@ url=%@ r=%d err=%@", bid, url.absoluteString ?: @"(无)", r, err ? (__bridge NSString *)err : @"无");
-            ok = (r == 0);
+        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 6.0;
+        NSString *cmdPath = @"/var/mobile/wxchooser_cmd.plist";
+        NSDictionary *cmd = @{ @"bid" : bid, @"url" : (url.absoluteString ?: @"") };
+        BOOL wrote = [cmd writeToFile:cmdPath atomically:YES];
+        WXLOG(@"写出启动命令 bid=%@ url=%@ ok=%d", bid, url.absoluteString ?: @"(无)", wrote);
+        if (!wrote) { gWXBusy = NO; return NO; }
+
+        NSString *bin = @"/var/mobile/wxchooser/wxchooseropen";
+        if (![[NSFileManager defaultManager] isExecutableFileAtPath:bin]) {
+            WXLOG(@"启动器不存在：%@", bin);
+            gWXBusy = NO;
+            return NO;
         }
-        if (!ok && gSBSLaunch) {
-            int r = gSBSLaunch((__bridge CFStringRef)bid, false);
-            WXLOG(@"SB 启动（无 URL）%@ r=%d", bid, r);
-            ok = (r == 0);
-        }
+        // 确保目录可执行（越狱目录有时是 700）
+        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions:@(0755)} ofItemAtPath:@"/var/mobile/wxchooser" error:nil];
+        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions:@(0755)} ofItemAtPath:bin error:nil];
+
+        const char *path = bin.UTF8String;
+        char *const argsv[] = { (char *)path, NULL };
+        char *const envv[] = { (char *)"PATH=/usr/bin:/bin:/usr/sbin:/sbin", (char *)"HOME=/var/mobile", NULL };
+        pid_t pid = 0;
+        int rc = posix_spawn(&pid, path, NULL, NULL, argsv, envv);
+        WXLOG(@"拉起启动器 pid=%d rc=%d", (int)pid, rc);
         gWXBusy = NO;
-        return ok;
+        return (rc == 0);
     } @catch (NSException *e) {
         gWXBusy = NO;
-        WXLOG(@"SBS 启动异常 %@", e.reason);
+        WXLOG(@"拉起动作异常 %@", e.reason);
         return NO;
     }
 }
