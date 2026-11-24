@@ -599,29 +599,42 @@ static void WXInstallHooks(void) {
 
 static UIWindow *gWXOverlay = nil;
 static volatile BOOL gWXOverlayVisible = NO;
+static NSString *const kWXGuard = @"/var/mobile/wxchooser.guard";
+static BOOL gWXGuardTripped = NO;
+static void WXSetGuard(BOOL on) {
+    @try {
+        if (on) [@"1" writeToFile:kWXGuard atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        else [[NSFileManager defaultManager] removeItemAtPath:kWXGuard error:nil];
+    } @catch (NSException *e) {}
+}
 static BOOL (*o_router_openURL)(id, SEL, NSURL *) = NULL;
 static BOOL (*o_router_openSensitive)(id, SEL, NSURL *) = NULL;
 
 static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
-    WXLoadSBS();
-    if (!bid.length) return NO;
-    gWXBusy = YES;
-    BOOL ok = NO;
-    if (gSBSLaunchWithURL) {
-        CFStringRef err = NULL;
-        int r = gSBSLaunchWithURL((__bridge CFStringRef)bid, (__bridge CFURLRef)url,
-                                  (__bridge CFDictionaryRef)@{}, &err, false);
-        WXLOG(@"SB 启动 %@ url=%@ r=%d err=%@", bid, url.absoluteString ?: @"(无)", r, err ? (__bridge NSString *)err : @"无");
-        if (err) CFRelease(err);
-        ok = (r == 0);
+    @try {
+        WXLoadSBS();
+        if (!bid.length) return NO;
+        gWXBusy = YES;
+        BOOL ok = NO;
+        if (gSBSLaunchWithURL) {
+            CFStringRef err = NULL;
+            int r = gSBSLaunchWithURL((__bridge CFStringRef)bid, (__bridge CFURLRef)url,
+                                      (__bridge CFDictionaryRef)@{}, &err, false);
+            WXLOG(@"SB 启动 %@ url=%@ r=%d err=%@", bid, url.absoluteString ?: @"(无)", r, err ? (__bridge NSString *)err : @"无");
+            ok = (r == 0);
+        }
+        if (!ok && gSBSLaunch) {
+            int r = gSBSLaunch((__bridge CFStringRef)bid, false);
+            WXLOG(@"SB 启动（无 URL）%@ r=%d", bid, r);
+            ok = (r == 0);
+        }
+        gWXBusy = NO;
+        return ok;
+    } @catch (NSException *e) {
+        gWXBusy = NO;
+        WXLOG(@"SBS 启动异常 %@", e.reason);
+        return NO;
     }
-    if (!ok && gSBSLaunch) {
-        int r = gSBSLaunch((__bridge CFStringRef)bid, false);
-        WXLOG(@"SB 启动（无 URL）%@ r=%d", bid, r);
-        ok = (r == 0);
-    }
-    gWXBusy = NO;
-    return ok;
 }
 
 static void WXSBHideOverlay(void) {
@@ -630,7 +643,41 @@ static void WXSBHideOverlay(void) {
         if (vc.presentedViewController) [vc dismissViewControllerAnimated:NO completion:nil];
         gWXOverlay.hidden = YES;
         gWXOverlayVisible = NO;
-    } @catch (NSException *e) {}
+        WXLOG(@"SB 窗口已隐藏");
+    } @catch (NSException *e) {
+        WXLOG(@"隐藏窗口异常 %@", e.reason);
+    }
+}
+
+static BOOL WXSBEnsureOverlay(void) {
+    if (gWXOverlay && gWXOverlay.windowScene) return YES;
+    @try {
+        UIWindow *w = gWXOverlay;
+        if (!w) {
+            w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+            w.windowLevel = UIWindowLevelAlert + 1;
+            w.backgroundColor = [UIColor clearColor];
+            w.rootViewController = [[UIViewController alloc] init];
+            w.rootViewController.view.backgroundColor = [UIColor clearColor];
+        }
+        UIWindowScene *sc = nil;
+        for (UIScene *cs in [UIApplication sharedApplication].connectedScenes) {
+            if ([cs isKindOfClass:[UIWindowScene class]]) { sc = (UIWindowScene *)cs; break; }
+        }
+        if (!sc) {
+            for (UIWindow *win in [UIApplication sharedApplication].windows) {
+                if (win.windowScene) { sc = win.windowScene; break; }
+            }
+        }
+        if (!sc) { WXLOG(@"SB 找不到 scene，放弃弹框"); return NO; }
+        w.windowScene = sc;
+        gWXOverlay = w;
+        WXLOG(@"SB 悬浮窗口就绪 level=%.0f scene=%@", w.windowLevel, NSStringFromClass([sc class]));
+        return YES;
+    } @catch (NSException *e) {
+        WXLOG(@"SB 建窗异常 %@", e.reason);
+        return NO;
+    }
 }
 
 static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void)) {
@@ -638,71 +685,51 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
         @try {
             NSURL *probe = url ?: [NSURL URLWithString:@"weixin://"];
             NSArray *cands = WXCandidatesForURL(probe);
-            WXLOG(@"SB 拦截（%@）%@ 候选 %lu 个", entry, url.absoluteString ?: @"(无 URL)", (unsigned long)cands.count);
-            for (NSDictionary *c in cands) WXLOG(@"  SB候选：%@ %@", c[@"bid"], c[@"name"]);
-
-            if (!gWXOverlay) {
-                UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-                // iOS 13+ 必须挂到一个真实的 UIWindowScene，否则窗口永远不显示
-                @try {
-                    UIWindowScene *sc = nil;
-                    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-                        if ([s isKindOfClass:[UIWindowScene class]] && s.activationState == UISceneActivationStateForegroundActive) { sc = (UIWindowScene *)s; break; }
-                    }
-                    if (!sc) {
-                        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-                            if ([s isKindOfClass:[UIWindowScene class]]) { sc = (UIWindowScene *)s; break; }
-                        }
-                    }
-                    if (!sc) {
-                        for (UIWindow *win in [UIApplication sharedApplication].windows) {
-                            if (win.windowScene) { sc = win.windowScene; break; }
-                        }
-                    }
-                    if (sc) { w.windowScene = sc; WXLOG(@"SB 窗口已挂 scene：%@", NSStringFromClass([sc class])); }
-                    else WXLOG(@"SB 窗口未找到 scene");
-                } @catch (NSException *e) { WXLOG(@"挂 scene 异常 %@", e.reason); }
-                w.windowLevel = UIWindowLevelAlert + 100;
-                w.backgroundColor = [UIColor clearColor];
-                w.rootViewController = [[UIViewController alloc] init];
-                w.rootViewController.view.backgroundColor = [UIColor clearColor];
-                gWXOverlay = w;
-                WXLOG(@"SB 悬浮窗口已创建 level=%.0f bounds=%@", w.windowLevel, NSStringFromCGRect(w.bounds));
+            WXLOG(@"SB 弹框（%@）%@ 候选 %lu", entry, url.absoluteString ?: @"(无 URL)", (unsigned long)cands.count);
+            if (!WXSBEnsureOverlay()) {
+                WXLOG(@"SB 无法建窗，改为放行");
+                if (fallback) fallback();
+                return;
             }
+            WXSetGuard(YES);
             gWXOverlay.hidden = NO;
-            @try { [gWXOverlay makeKeyAndVisible]; } @catch (NSException *e) {}
             gWXOverlayVisible = YES;
-            WXLOG(@"SB 窗口状态：hidden=%d key=%d alpha=%.2f scene=%@", gWXOverlay.isHidden, gWXOverlay.isKeyWindow,
-                  gWXOverlay.alpha, gWXOverlay.windowScene ? @"有" : @"无");
             UIViewController *top = gWXOverlay.rootViewController;
             while (top.presentedViewController) top = top.presentedViewController;
 
             UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"打开微信"
                                                                        message:@"选择要跳转的微信"
                                                                 preferredStyle:UIAlertControllerStyleActionSheet];
-            for (NSDictionary *cand in cands) {
-                [ac addAction:[UIAlertAction actionWithTitle:(cand[@"name"] ?: cand[@"bid"])
-                                                       style:UIAlertActionStyleDefault
-                                                     handler:^(UIAlertAction *a) {
-                    WXSBLaunchByBundle(url, cand[@"bid"]);
+            NSArray *snapshot = cands;
+            for (NSDictionary *cand in snapshot) {
+                NSString *bid = cand[@"bid"];
+                NSString *nm = cand[@"name"] ?: bid;
+                [ac addAction:[UIAlertAction actionWithTitle:nm style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                    WXLOG(@"用户选择：%@ (%@)", nm, bid);
                     WXSBHideOverlay();
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        WXSBLaunchByBundle(url, bid);
+                    });
                 }]];
             }
-            [ac addAction:[UIAlertAction actionWithTitle:@"系统默认" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-                if (fallback) fallback();
+            [ac addAction:[UIAlertAction actionWithTitle:@"系统默认微信" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                WXLOG(@"用户选择：系统默认");
                 WXSBHideOverlay();
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    WXSBLaunchByBundle(url, @"com.tencent.xin");
+                });
             }]];
             [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
-                WXLOG(@"SB: 用户取消");
+                WXLOG(@"用户取消");
                 WXSBHideOverlay();
             }]];
-            if (ac.popoverPresentationController) {
-                ac.popoverPresentationController.sourceView = top.view;
-                ac.popoverPresentationController.sourceRect = CGRectMake(top.view.bounds.size.width / 2.0, top.view.bounds.size.height, 1, 1);
-            }
-            [top presentViewController:ac animated:YES completion:nil];
+            [top presentViewController:ac animated:NO completion:^{
+                WXSetGuard(NO);
+                WXLOG(@"SB 弹框已呈现");
+            }];
         } @catch (NSException *e) {
             WXLOG(@"SB 弹框异常 %@", e.reason);
+            if (fallback) fallback();
         }
     });
 }
@@ -872,72 +899,65 @@ static NSString *WXWeixinURLFromString(NSString *s) {
 }
 
 static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long options, id validator) {
-    BOOL handled = NO;
+    BOOL intercept = NO;
+    NSURL *hitURL = nil;
     @try {
-        if (!gWXBusy) {
+        if (!gWXBusy && !gWXOverlayVisible && !gWXGuardTripped) {
             NSString *bid = WXBundleFromRequest(request);
             NSURL *u = WXLookupURL(request, 0);
             NSString *desc = nil;
-            BOOL looksWX = [bid isEqualToString:@"com.tencent.xin"] || [bid hasPrefix:@"com.tencent.xin"];
+            BOOL looksWX = [bid hasPrefix:@"com.tencent.xin"];
             if (!looksWX) {
                 @try { desc = [request description]; } @catch (NSException *e) {}
                 looksWX = [desc containsString:@"com.tencent.xin"];
             }
-            BOOL urlLike = (u && WXIsWeixinScheme(u.scheme ?: @""))
+            BOOL urlLike = (u && WXIsTargetURL(u))
                         || (desc && [desc.lowercaseString containsString:@"weixin"])
                         || (u && WXIsWeChatWebURL(u));
-            if (looksWX && urlLike && !WXIsSelfWeChat() && !gWXOverlayVisible) {
+            if (looksWX && urlLike) {
                 if (!desc) { @try { desc = [request description]; } @catch (NSException *e) {} }
                 if (!u) {
-                    int budget = 500;
+                    int budget = 400;
                     NSString *raw = WXScanForWeixinString(request, 0, &budget);
                     if (!raw) raw = WXWeixinURLFromString(desc);
                     if (raw) {
                         NSURL *cand = [NSURL URLWithString:raw];
-                        if (cand && WXIsTargetURL(cand)) { u = cand; WXLOG(@"  深度反射拿到 URL：%@", raw); }
-                        else WXLOG(@"  反射到的字符串不是有效微信 URL：%@", raw);
+                        if (cand && WXIsTargetURL(cand)) { u = cand; WXLOG(@"  取到真实 URL：%@", raw); }
+                        else WXLOG(@"  取到的不是有效微信 URL：%@", raw);
                     }
                 }
-                WXLOG(@"★ SB 拦到拉起微信：bid=%@ url=%@ options=%llu", bid ?: @"(未知)", u.absoluteString ?: @"(无)", options);
-                WXLOG(@"  [请求类] %@", NSStringFromClass([request class]));
-                for (NSString *k in @[@"applicationSceneEntities", @"entities", @"context", @"finalDestination",
-                                     @"applicationSceneEntity", @"targetApplication", @"requestedURL", @"URL", @"url",
-                                     @"sceneSettings", @"actions", @"application"]) {
-                    SEL ks = NSSelectorFromString(k);
-                    if (![request respondsToSelector:ks]) continue;
-                    @try {
-                        id v = ((id (*)(id, SEL))objc_msgSend)(request, ks);
-                        WXLOG(@"    %@ => %@", k, v ? NSStringFromClass([v class]) : @"nil");
-                        if ([v isKindOfClass:[NSArray class]]) {
-                            for (id e in (NSArray *)v) {
-                                WXLOG(@"      [元素] %@", NSStringFromClass([e class]));
-                                for (NSString *k2 in @[@"application", @"scene", @"actions", @"sceneSettings", @"applicationSceneSettings", @"workspaceEntity"]) {
-                                    SEL s2 = NSSelectorFromString(k2);
-                                    if (![e respondsToSelector:s2]) continue;
-                                    @try {
-                                        id v2 = ((id (*)(id, SEL))objc_msgSend)(e, s2);
-                                        WXLOG(@"        %@ => %@", k2, v2 ? NSStringFromClass([v2 class]) : @"nil");
-                                    } @catch (NSException *e2) {}
-                                }
-                            }
-                        }
-                    } @catch (NSException *e3) {}
+                static CFAbsoluteTime lastHit = 0;
+                CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+                BOOL tooSoon = (now - lastHit < 1.2);
+                if (!tooSoon && WXSBEnsureOverlay()) {
+                    lastHit = now;
+                    WXLOG(@"★ SB 拦到拉起微信：bid=%@ url=%@", bid ?: @"(未知)", u.absoluteString ?: @"(无)");
+                    if ([request respondsToSelector:NSSelectorFromString(@"declineWithReason:")]) {
+                        @try {
+                            ((void (*)(id, SEL, id))objc_msgSend)(request, NSSelectorFromString(@"declineWithReason:"), @"WXChooser 接管");
+                            WXLOG(@"  已拒绝原启动事务");
+                        } @catch (NSException *e) { WXLOG(@"  拒绝失败 %@", e.reason); }
+                    }
+                    intercept = YES;
+                    hitURL = u;
+                } else if (tooSoon) {
+                    WXLOG(@"SB 短时间重复命中，放行原启动");
+                } else {
+                    WXLOG(@"SB 建窗失败，放行原启动");
                 }
-                NSString *ds = desc ?: @"";
-                WXLOG(@"  [描述] %@", ds.length > 1100 ? [ds substringToIndex:1100] : ds);
-                if ([request respondsToSelector:NSSelectorFromString(@"declineWithReason:")]) {
-                    ((void (*)(id, SEL, id))objc_msgSend)(request, NSSelectorFromString(@"declineWithReason:"), @"WXChooser 接管");
-                    WXLOG(@"  已拒绝原启动事务，改由本插件拉起");
-                }
-                WXSBShowChooser(u, @"SBMainWorkspace", nil);
-                handled = YES;
             }
         }
     } @catch (NSException *e) {
         WXLOG(@"SBMainWorkspace 拦截异常 %@", e.reason);
     }
-    if (handled) return;
-    if (o_sbmw_execute) o_sbmw_execute(self, _cmd, request, options, validator);
+    if (intercept) {
+        WXSBShowChooser(hitURL, @"SBMainWorkspace", nil);
+        return;
+    }
+    if (o_sbmw_execute) {
+        @try { o_sbmw_execute(self, _cmd, request, options, validator); }
+        @catch (NSException *e) { WXLOG(@"调用原方法异常 %@", e.reason); }
+    }
 }
 
 static void WXInstallWorkspaceHook(void) {
@@ -982,6 +1002,11 @@ __attribute__((constructor)) static void WXInit(void) {
     WXLOG(@"LOADED in %@ (%@)", WXSelfBundleID(), WXIsSelfWeChat() ? @"微信本体" : @"其他进程");
     WXInstallHooks();
     if ([WXSelfBundleID() isEqualToString:@"com.apple.springboard"]) {
+        if ([[NSFileManager defaultManager] fileExistsAtPath:kWXGuard]) {
+            gWXGuardTripped = YES;
+            WXSetGuard(NO);
+            WXLOG(@"⚠ 检测到上次弹框把 SpringBoard 弄崩了，本会话不再弹框（直接放行）");
+        }
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                         WXDarwinCallback, CFSTR("com.fengxin.wxchooser.launch"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
