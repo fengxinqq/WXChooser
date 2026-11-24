@@ -598,18 +598,30 @@ static void WXInstallHooks(void) {
 #pragma mark - SpringBoard 层的 URL 路由拦截
 
 static UIWindow *gWXOverlay = nil;
+static volatile BOOL gWXOverlayVisible = NO;
 static BOOL (*o_router_openURL)(id, SEL, NSURL *) = NULL;
 static BOOL (*o_router_openSensitive)(id, SEL, NSURL *) = NULL;
 
 static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
     WXLoadSBS();
-    if (!gSBSLaunchWithURL || !bid.length) return NO;
-    CFStringRef err = NULL;
-    int r = gSBSLaunchWithURL((__bridge CFStringRef)bid, (__bridge CFURLRef)url,
-                              (__bridge CFDictionaryRef)@{}, &err, false);
-    WXLOG(@"SB 启动 %@ r=%d err=%@", bid, r, err ? (__bridge NSString *)err : @"无");
-    if (err) CFRelease(err);
-    return (r == 0);
+    if (!bid.length) return NO;
+    gWXBusy = YES;
+    BOOL ok = NO;
+    if (gSBSLaunchWithURL) {
+        CFStringRef err = NULL;
+        int r = gSBSLaunchWithURL((__bridge CFStringRef)bid, (__bridge CFURLRef)url,
+                                  (__bridge CFDictionaryRef)@{}, &err, false);
+        WXLOG(@"SB 启动 %@ url=%@ r=%d err=%@", bid, url.absoluteString ?: @"(无)", r, err ? (__bridge NSString *)err : @"无");
+        if (err) CFRelease(err);
+        ok = (r == 0);
+    }
+    if (!ok && gSBSLaunch) {
+        int r = gSBSLaunch((__bridge CFStringRef)bid, false);
+        WXLOG(@"SB 启动（无 URL）%@ r=%d", bid, r);
+        ok = (r == 0);
+    }
+    gWXBusy = NO;
+    return ok;
 }
 
 static void WXSBHideOverlay(void) {
@@ -617,14 +629,16 @@ static void WXSBHideOverlay(void) {
         UIViewController *vc = gWXOverlay.rootViewController;
         if (vc.presentedViewController) [vc dismissViewControllerAnimated:NO completion:nil];
         gWXOverlay.hidden = YES;
+        gWXOverlayVisible = NO;
     } @catch (NSException *e) {}
 }
 
 static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void)) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            NSArray *cands = WXCandidatesForURL(url);
-            WXLOG(@"SB 拦截（%@）%@ 候选 %lu 个", entry, url.absoluteString, (unsigned long)cands.count);
+            NSURL *probe = url ?: [NSURL URLWithString:@"weixin://"];
+            NSArray *cands = WXCandidatesForURL(probe);
+            WXLOG(@"SB 拦截（%@）%@ 候选 %lu 个", entry, url.absoluteString ?: @"(无 URL)", (unsigned long)cands.count);
             for (NSDictionary *c in cands) WXLOG(@"  SB候选：%@ %@", c[@"bid"], c[@"name"]);
 
             if (!gWXOverlay) {
@@ -637,6 +651,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                 gWXOverlay = w;
             }
             gWXOverlay.hidden = NO;
+            gWXOverlayVisible = YES;
             UIViewController *top = gWXOverlay.rootViewController;
             while (top.presentedViewController) top = top.presentedViewController;
 
@@ -702,6 +717,141 @@ static BOOL h_router_openSensitive(id self, SEL _cmd, NSURL *url) {
     return o_router_openSensitive ? o_router_openSensitive(self, _cmd, url) : NO;
 }
 
+#pragma mark - 系统层：SBMainWorkspace 启动事务拦截
+
+static void (*o_sbmw_execute)(id, SEL, id, unsigned long long, id) = NULL;
+
+static NSURL *WXActionURL(id o) {
+    NSString *cn = NSStringFromClass([o class]) ?: @"";
+    if (![cn containsString:@"UIOpenURLAction"]) return nil;
+    for (NSString *key in @[@"URL", @"url"]) {
+        SEL sel = NSSelectorFromString(key);
+        if ([o respondsToSelector:sel]) {
+            id v = ((id (*)(id, SEL))objc_msgSend)(o, sel);
+            if ([v isKindOfClass:[NSURL class]]) return (NSURL *)v;
+        }
+    }
+    return nil;
+}
+
+static NSURL *WXLookupURL(id obj, int depth) {
+    if (!obj || depth > 3) return nil;
+    NSURL *u = WXActionURL(obj);
+    if (u) return u;
+    if ([obj isKindOfClass:[NSArray class]]) {
+        for (id x in (NSArray *)obj) { NSURL *r = WXLookupURL(x, depth + 1); if (r) return r; }
+        return nil;
+    }
+    if ([obj isKindOfClass:[NSSet class]]) {
+        for (id x in (NSSet *)obj) { NSURL *r = WXLookupURL(x, depth + 1); if (r) return r; }
+        return nil;
+    }
+    for (NSString *key in @[@"actions", @"applicationSceneEntities", @"entities", @"sceneSettings",
+                            @"applicationSceneSettings", @"context", @"settings"]) {
+        SEL sel = NSSelectorFromString(key);
+        if ([obj respondsToSelector:sel]) {
+            @try {
+                id v = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+                NSURL *r = WXLookupURL(v, depth + 1);
+                if (r) return r;
+            } @catch (NSException *e) {}
+        }
+    }
+    return nil;
+}
+
+static NSString *WXBundleFromRequest(id req) {
+    for (NSString *key in @[@"applicationSceneEntities", @"entities"]) {
+        SEL sel = NSSelectorFromString(key);
+        if (![req respondsToSelector:sel]) continue;
+        id arr = nil;
+        @try { arr = ((id (*)(id, SEL))objc_msgSend)(req, sel); } @catch (NSException *e) {}
+        if (![arr isKindOfClass:[NSArray class]]) continue;
+        for (id entity in (NSArray *)arr) {
+            for (NSString *k2 in @[@"application", @"scene"]) {
+                SEL s2 = NSSelectorFromString(k2);
+                if (![entity respondsToSelector:s2]) continue;
+                id v = nil;
+                @try { v = ((id (*)(id, SEL))objc_msgSend)(entity, s2); } @catch (NSException *e) { continue; }
+                NSString *bid = nil;
+                if ([v respondsToSelector:NSSelectorFromString(@"bundleIdentifier")]) {
+                    bid = ((id (*)(id, SEL))objc_msgSend)(v, NSSelectorFromString(@"bundleIdentifier"));
+                } else if ([v respondsToSelector:NSSelectorFromString(@"identifier")]) {
+                    id sid = ((id (*)(id, SEL))objc_msgSend)(v, NSSelectorFromString(@"identifier"));
+                    if ([sid isKindOfClass:[NSString class]]) bid = (NSString *)sid;
+                }
+                if ([bid isKindOfClass:[NSString class]] && bid.length) return bid;
+            }
+        }
+    }
+    return nil;
+}
+
+static NSString *WXWeixinURLFromString(NSString *s) {
+    if (!s.length) return nil;
+    NSRange r = [s rangeOfString:@"weixin" options:NSCaseInsensitiveSearch];
+    if (r.location == NSNotFound) return nil;
+    NSUInteger i = r.location;
+    NSMutableString *out = [NSMutableString string];
+    while (i < s.length) {
+        unichar c = [s characterAtIndex:i];
+        if (c == ' ' || c == '"' || c == '\'' || c == '>' || c == '<' || c == ')' || c == '\n' || c == '\\') break;
+        [out appendFormat:@"%C", c];
+        i++;
+    }
+    return out.length > 6 ? out : nil;
+}
+
+static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long options, id validator) {
+    BOOL handled = NO;
+    @try {
+        if (!gWXBusy) {
+            NSString *bid = WXBundleFromRequest(request);
+            NSURL *u = WXLookupURL(request, 0);
+            NSString *desc = nil;
+            BOOL looksWX = [bid isEqualToString:@"com.tencent.xin"] || [bid hasPrefix:@"com.tencent.xin"];
+            if (!looksWX) {
+                @try { desc = [request description]; } @catch (NSException *e) {}
+                looksWX = [desc containsString:@"com.tencent.xin"];
+            }
+            BOOL urlLike = (u && WXIsWeixinScheme(u.scheme ?: @""))
+                        || (desc && [desc.lowercaseString containsString:@"weixin"])
+                        || (u && WXIsWeChatWebURL(u));
+            if (looksWX && urlLike && !WXIsSelfWeChat() && !gWXOverlayVisible) {
+                if (!u) {
+                    NSString *raw = WXWeixinURLFromString(desc);
+                    if (raw) u = [NSURL URLWithString:raw];
+                }
+                WXLOG(@"★ SB 拦到拉起微信：bid=%@ url=%@ options=%llu", bid ?: @"(未知)", u.absoluteString ?: @"(无)", options);
+                if ([request respondsToSelector:NSSelectorFromString(@"declineWithReason:")]) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(request, NSSelectorFromString(@"declineWithReason:"), @"WXChooser 接管");
+                    WXLOG(@"  已拒绝原启动事务，改由本插件拉起");
+                }
+                WXSBShowChooser(u, @"SBMainWorkspace", nil);
+                handled = YES;
+            }
+        }
+    } @catch (NSException *e) {
+        WXLOG(@"SBMainWorkspace 拦截异常 %@", e.reason);
+    }
+    if (handled) return;
+    if (o_sbmw_execute) o_sbmw_execute(self, _cmd, request, options, validator);
+}
+
+static void WXInstallWorkspaceHook(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    Class ws = NSClassFromString(@"SBMainWorkspace");
+    if (!ws) { WXLOG(@"SBMainWorkspace 不存在"); return; }
+    NSString *selName = @"_executeTransitionRequest:options:validator:";
+    Method m = class_getInstanceMethod(ws, NSSelectorFromString(selName));
+    if (!m) { WXLOG(@"挂钩跳过：SBMainWorkspace %@ 不存在", selName); return; }
+    o_sbmw_execute = (void (*)(id, SEL, id, unsigned long long, id))method_getImplementation(m);
+    method_setImplementation(m, (IMP)h_sbmw_execute);
+    WXLOG(@"挂钩成功：SBMainWorkspace _executeTransitionRequest:options:validator:");
+}
+
 static void WXInstallRouterHooks(void) {
     static BOOL done = NO;
     if (done) return;
@@ -747,6 +897,7 @@ __attribute__((constructor)) static void WXInit(void) {
         WXLOG(@"SB: 已注册代办启动监听 + 报到监听");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             WXInstallRouterHooks();
+            WXInstallWorkspaceHook();
         });
     } else {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
