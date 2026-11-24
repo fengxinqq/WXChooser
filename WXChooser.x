@@ -1146,9 +1146,24 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
                     intercept = YES;
                     hitURL = u;
                 } else if (tooSoon) {
-                    WXLOG(@"SB 短时间重复命中，放行原启动");
+                    WXLOG(@"SB 短时间重复命中，静默拒绝（不放行）");
+                    if ([request respondsToSelector:NSSelectorFromString(@"declineWithReason:")]) {
+                        @try {
+                            ((void (*)(id, SEL, id))objc_msgSend)(request, NSSelectorFromString(@"declineWithReason:"), @"WXChooser 静默接管");
+                            WXLOG(@"  已静默拒绝重复事务");
+                        } @catch (NSException *e) {}
+                    }
+                    intercept = YES;
+                    hitURL = u;
                 } else {
-                    WXLOG(@"SB 建窗失败，放行原启动");
+                    WXLOG(@"SB 建窗失败，静默拒绝（不放行）");
+                    if ([request respondsToSelector:NSSelectorFromString(@"declineWithReason:")]) {
+                        @try {
+                            ((void (*)(id, SEL, id))objc_msgSend)(request, NSSelectorFromString(@"declineWithReason:"), @"WXChooser 静默接管");
+                        } @catch (NSException *e) {}
+                    }
+                    intercept = YES;
+                    hitURL = u;
                 }
             }
         }
