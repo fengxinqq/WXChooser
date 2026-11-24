@@ -446,11 +446,10 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
 // 返回 YES 表示已经由本插件接管（调用方应直接返回成功）
 static BOOL WXTryIntercept(NSURL *url, NSDictionary *options, void (^completion)(BOOL), NSString *entry) {
     if (gWXBusy) return NO;
-    // 只在 SpringBoard 里弹框；App 进程内一律放行，避免重复弹框与进程内拉起导致崩溃
-    if (![WXSelfBundleID() isEqualToString:@"com.apple.springboard"]) {
-        WXLOG(@"[%@] 非 SpringBoard，直接放行 %@", entry, url.absoluteString);
-        return NO;
-    }
+    NSString *selfBid = WXSelfBundleID();
+    BOOL inSpringBoard = [selfBid isEqualToString:@"com.apple.springboard"];
+    WXLOG(@"[%@] 入口调用 App=%@ url=%@", entry, selfBid ?: @"(未知)", url.absoluteString ?: @"(无)");
+    if (inSpringBoard) return NO;   // SpringBoard 走 SBMainWorkspace 那一层
     @try {
         if (!url) return NO;
         NSString *scheme = url.scheme ?: @"";
