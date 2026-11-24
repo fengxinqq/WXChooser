@@ -999,7 +999,7 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
             }
             NSString *desc = nil;
             static int dbgCount = 0;
-            if (!looksWX && dbgCount < 150) {
+            if (!bidKnown && dbgCount < 150) {
                 dbgCount++;
                 if (!desc) { @try { desc = [request description]; } @catch (NSException *e) {} }
                 if (desc.length) WXLOG(@"  事务样本 %@", [desc substringToIndex:MIN(desc.length, 150u)]);
