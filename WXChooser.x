@@ -610,6 +610,12 @@ static volatile BOOL gWXOverlayVisible = NO;
 static NSString *const kWXGuard = @"/var/mobile/wxchooser.guard";
 static BOOL gWXGuardTripped = NO;
 static CFAbsoluteTime gWXSuppressUntil = 0;
+static id gWXPendingReq = nil;
+static id gWXPendingSelf = nil;
+static id gWXPendingValidator = nil;
+static unsigned long long gWXPendingOpts = 0;
+static SEL gWXPendingCmd = NULL;
+static BOOL WXReplayPending(void);
 static void WXSetGuard(BOOL on) {
     @try {
         if (on) [@"1" writeToFile:kWXGuard atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -643,6 +649,12 @@ static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
         gWXBusy = YES;
         gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 8.0;
 
+        if ([bid isEqualToString:@"com.tencent.xin"] && gWXPendingReq) {
+            BOOL ok = WXReplayPending();
+            WXLOG(@"重放结果 %d", ok);
+            if (ok) { gWXBusy = NO; return YES; }
+        }
+
         NSMutableArray *paths = [NSMutableArray array];
         NSString *selfPath = WXOpenerPath();
         if (selfPath) [paths addObject:selfPath];
@@ -673,6 +685,35 @@ static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
     } @catch (NSException *e) {
         gWXBusy = NO;
         WXLOG(@"拉起动作异常 %@", e.reason);
+        return NO;
+    }
+}
+
+// 重放 SpringBoard 自己那条被拦下的启动事务（不经过任何外部接口）
+static BOOL WXReplayInner(void);
+
+static BOOL WXReplayPending(void) {
+    __block BOOL ok = NO;
+    dispatch_block_t blk = ^{ ok = WXReplayInner(); };
+    if ([NSThread isMainThread]) blk();
+    else dispatch_sync(dispatch_get_main_queue(), blk);
+    return ok;
+}
+
+static BOOL WXReplayInner(void) {
+    if (!gWXPendingReq || !o_sbmw_execute) { WXLOG(@"重放失败：没有保存的事务"); return NO; }
+    id req = gWXPendingReq;
+    id self0 = gWXPendingSelf;
+    SEL cmd = gWXPendingCmd;
+    unsigned long long opts = gWXPendingOpts;
+    id val = gWXPendingValidator;
+    @try {
+        WXLOG(@"重放原始启动事务…");
+        o_sbmw_execute(self0, cmd, req, opts, val);
+        WXLOG(@"重放已执行，无异常");
+        return YES;
+    } @catch (NSException *e) {
+        WXLOG(@"重放异常 %@", e.reason);
         return NO;
     }
 }
@@ -1008,6 +1049,7 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
             if (!looksWX) {
                 @try { desc = [request description]; } @catch (NSException *e) {}
                 looksWX = [desc containsString:@"com.tencent.xin"];
+                if (looksWX) { bidKnown = YES; WXLOG(@"  从事务描述认得目标微信"); }
             }
             BOOL urlLike = (u && WXIsTargetURL(u))
                         || (desc && [desc.lowercaseString containsString:@"weixin"])
@@ -1030,6 +1072,11 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
                 if (!tooSoon && WXSBEnsureOverlay()) {
                     lastHit = now;
                     WXLOG(@"★ SB 拦到拉起微信：bid=%@ url=%@", bid ?: @"(未知)", u.absoluteString ?: @"(无)");
+                    gWXPendingReq = request;
+                    gWXPendingSelf = self;
+                    gWXPendingCmd = _cmd;
+                    gWXPendingOpts = options;
+                    gWXPendingValidator = validator;
                     if ([request respondsToSelector:NSSelectorFromString(@"declineWithReason:")]) {
                         @try {
                             ((void (*)(id, SEL, id))objc_msgSend)(request, NSSelectorFromString(@"declineWithReason:"), @"WXChooser 接管");

@@ -78,7 +78,8 @@ int main(int argc, char **argv) {
 
         // 1) 带 URL + 目标包名的配置打开
         r = runWithTimeout(@"openURL:configuration:", 4.0, ^{
-            id cfg = cfgCls ? ((id (*)(id, SEL))objc_msgSend)(cfgCls, sel_getUid("new")) : nil;
+            if (!cfgCls) { LG(@"本机没有配置类，跳过这条路径"); return NO; }
+            id cfg = ((id (*)(id, SEL))objc_msgSend)(cfgCls, sel_getUid("new"));
             for (NSString *k in @[@"targetApplicationBundleIdentifier", @"applicationBundleIdentifier", @"bundleIdentifier"]) {
                 @try { [cfg setValue:bid forKey:k]; LG(@"配置写入 %@ 成功", k); break; }
                 @catch (NSException *e) { LG(@"配置写入 %@ 失败", k); }
