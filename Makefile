@@ -15,6 +15,7 @@ include $(THEOS_MAKE_PATH)/tweak.mk
 TOOL_NAME = wxchooseropen
 wxchooseropen_FILES = wxchooseropen_main.m
 wxchooseropen_FRAMEWORKS = Foundation UIKit
+wxchooseropen_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 wxchooseropen_INSTALL_PATH = /Library/MobileSubstrate/DynamicLibraries
 wxchooseropen_CODESIGN_FLAGS = -Swxchooseropen.entitlements
 
