@@ -81,17 +81,19 @@ static BOOL WXIsStrictWeChatScheme(NSString *scheme) {
     return NO;
 }
 
-// 是否可能是微信类应用：包名像微信，或显示名含「微信」
+// 是否可能是微信类应用：包名像微信，或显示名含「微信」且注册了 weixin 系 scheme
 static BOOL WXLooksLikeWeChat(NSString *bid, NSString *name, NSArray<NSString *> *schemes) {
     NSString *b = bid.lowercaseString ?: @"";
     NSString *n = name ?: @"";
     if ([b containsString:@"tencent.xin"]) return YES;
     if ([b containsString:@"weixin"]) return YES;
     if ([b containsString:@"wechat"]) return YES;
-    if ([n containsString:@"微信"]) return YES;
+    BOOL hasWeixinScheme = NO;
     for (NSString *s in schemes) {
-        if (WXIsStrictWeChatScheme(s)) return YES;
+        NSString *low = s.lowercaseString;
+        if ([low isEqualToString:@"weixin"] || [low isEqualToString:@"wechat"] || [low hasPrefix:@"weixin"]) { hasWeixinScheme = YES; break; }
     }
+    if ([n containsString:@"微信"] && hasWeixinScheme) return YES;
     return NO;
 }
 
@@ -280,7 +282,7 @@ static void WXLoadSBS(void) {
     dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_NOW);
     gSBSLaunchWithURL = (int (*)(CFStringRef, CFURLRef, CFDictionaryRef, CFStringRef *, Boolean))dlsym(RTLD_DEFAULT, "SBSLaunchApplicationWithIdentifierAndURLAndLaunchOptions");
     gSBSLaunch = (int (*)(CFStringRef, Boolean))dlsym(RTLD_DEFAULT, "SBSLaunchApplicationWithIdentifier");
-    WXLOG(@"SBS 接口：withURL=%s launch=%s", gSBSLaunchWithURL ? "有" : "无", gSBSLaunch ? "有" : "无");
+    WXLOG(@"SBS 接口：withURL=%@ launch=%@", gSBSLaunchWithURL ? @"有" : @"无", gSBSLaunch ? @"有" : @"无");
 }
 
 static void WXHandleLaunchRequest(void) {
@@ -306,6 +308,35 @@ static void WXHandleLaunchRequest(void) {
 
 static void WXDarwinCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     dispatch_async(dispatch_get_main_queue(), ^{ WXHandleLaunchRequest(); });
+}
+
+// 只在 SpringBoard 里跑：把系统里跟“启动应用 / 打开 URL”相关的方法名导出，方便定位真正的拦截点
+static void WXDumpLaunchAPIs(void) {
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return;
+    Class *classes = (Class *)malloc(sizeof(Class) * count);
+    if (!classes) return;
+    objc_getClassList(classes, count);
+    NSMutableArray *lines = [NSMutableArray array];
+    for (int i = 0; i < count; i++) {
+        NSString *cn = NSStringFromClass(classes[i]);
+        if (!cn.length) continue;
+        if (!([cn containsString:@"Applic"] || [cn containsString:@"Launch"] ||
+              [cn containsString:@"OpenURL"] || [cn containsString:@"Workspace"])) continue;
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(classes[i], &mc);
+        for (unsigned j = 0; j < mc; j++) {
+            NSString *sn = NSStringFromSelector(method_getName(ms[j]));
+            NSString *low = sn.lowercaseString;
+            if (!([low containsString:@"open"] || [low containsString:@"url"] || [low containsString:@"launch"])) continue;
+            [lines addObject:[NSString stringWithFormat:@"%@ -%@", cn, sn]];
+        }
+        if (ms) free(ms);
+    }
+    free(classes);
+    WXLOG(@"DUMP 启动相关方法共 %lu 条", (unsigned long)lines.count);
+    NSUInteger limit = MIN(lines.count, (NSUInteger)500);
+    for (NSUInteger i = 0; i < limit; i++) WXLOG(@"  D %@", lines[i]);
 }
 
 static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDictionary *options, void (^completion)(BOOL)) {
@@ -523,6 +554,9 @@ __attribute__((constructor)) static void WXInit(void) {
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         WXLoadSBS();
         WXLOG(@"SB: 已注册代办启动监听");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            WXDumpLaunchAPIs();
+        });
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         WXInstallHooks();
