@@ -31,6 +31,8 @@ static void WXWriteLog(NSString *line) {
 
 #define WXLOG(...) WXWriteLog([NSString stringWithFormat:__VA_ARGS__])
 
+static void (*o_sbmw_execute)(id, SEL, id, unsigned long long, id) = NULL;
+
 static volatile BOOL gWXBusy = NO;
 
 static NSString *WXSelfBundleID(void) {
@@ -853,7 +855,6 @@ static BOOL h_router_openSensitive(id self, SEL _cmd, NSURL *url) {
 
 #pragma mark - 系统层：SBMainWorkspace 启动事务拦截
 
-static void (*o_sbmw_execute)(id, SEL, id, unsigned long long, id) = NULL;
 
 static NSURL *WXActionURL(id o) {
     NSString *cn = NSStringFromClass([o class]) ?: @"";
