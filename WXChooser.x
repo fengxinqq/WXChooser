@@ -31,6 +31,28 @@ static NSString *WXSelfBundleID(void) {
     return bid;
 }
 
+// 沙盒进程写不了 /var/mobile，改用 Darwin 通知向 SpringBoard 报到（SpringBoard 负责落日志）
+static NSString *WXPingNameForBID(NSString *bid) {
+    NSString *b = bid.lowercaseString;
+    if (!b.length) return nil;
+    if ([b isEqualToString:@"com.chinaunicom.mobilebusiness"]) return @"com.fengxin.wxchooser.loaded.chinaunicom";
+    if ([b isEqualToString:@"wiki.qaq.umbra"]) return @"com.fengxin.wxchooser.loaded.umbra";
+    if ([b containsString:@"safariviewservice"]) return @"com.fengxin.wxchooser.loaded.safariview";
+    if ([b containsString:@"webkit.webcontent"]) return @"com.fengxin.wxchooser.loaded.webcontent";
+    if ([b isEqualToString:@"com.apple.mobilesafari"]) return @"com.fengxin.wxchooser.loaded.safari";
+    if ([b containsString:@"launchservicesd"]) return @"com.fengxin.wxchooser.loaded.lsd";
+    return nil;
+}
+
+static void WXPostLoadedPing(void) {
+    @try {
+        NSString *name = WXPingNameForBID(WXSelfBundleID());
+        if (!name) return;
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                            (__bridge CFStringRef)name, NULL, NULL, true);
+    } @catch (NSException *e) {}
+}
+
 static BOOL WXIsSelfWeChat(void) {
     NSString *b = WXSelfBundleID().lowercaseString;
     if (!b.length) return NO;
@@ -42,6 +64,23 @@ static BOOL WXIsWeixinScheme(NSString *scheme) {
     if (!s.length) return NO;
     if ([s hasPrefix:@"weixin"]) return YES;
     if ([s hasPrefix:@"wx"] && s.length > 2) return YES;
+    return NO;
+}
+
+static BOOL WXIsWeChatWebURL(NSURL *url) {
+    NSString *scheme = url.scheme.lowercaseString;
+    if (!([scheme isEqualToString:@"https"] || [scheme isEqualToString:@"http"])) return NO;
+    NSString *host = (url.host ?: @"").lowercaseString;
+    NSString *path = (url.path ?: @"").lowercaseString;
+    if (host.length && ([host containsString:@"weixin"] || [host containsString:@"wechat"] || [host containsString:@"tenpay"] || [host containsString:@"tencent.com"])) return YES;
+    if (path.length && ([path containsString:@"weixin"] || [path containsString:@"wechat"] || [path containsString:@"tenpay"])) return YES;
+    return NO;
+}
+
+static BOOL WXIsTargetURL(NSURL *url) {
+    if (!url) return NO;
+    if (WXIsWeixinScheme(url.scheme ?: @"")) return YES;
+    if (WXIsWeChatWebURL(url)) return YES;
     return NO;
 }
 
@@ -306,6 +345,18 @@ static void WXHandleLaunchRequest(void) {
     [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
 }
 
+static void WXPingCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    NSString *nm = (__bridge NSString *)name;
+    NSString *who = nm.lastPathComponent;
+    if ([who isEqualToString:@"chinaunicom"]) who = @"中国联通";
+    else if ([who isEqualToString:@"umbra"]) who = @"Umbra";
+    else if ([who isEqualToString:@"safariview"]) who = @"SafariViewService";
+    else if ([who isEqualToString:@"webcontent"]) who = @"WebKit WebContent";
+    else if ([who isEqualToString:@"safari"]) who = @"Safari";
+    else if ([who isEqualToString:@"lsd"]) who = @"launchservicesd";
+    WXLOG(@"★ 报到：%@ 已加载插件", who);
+}
+
 static void WXDarwinCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     dispatch_async(dispatch_get_main_queue(), ^{ WXHandleLaunchRequest(); });
 }
@@ -388,10 +439,9 @@ static BOOL WXTryIntercept(NSURL *url, NSDictionary *options, void (^completion)
         NSString *host = url.host ?: @"";
         WXLOG(@"[%@] %@ //%@", entry, scheme.length ? scheme : @"(无)", host);
         if (WXIsSelfWeChat()) return NO;
+        if (!WXIsTargetURL(url)) return NO;
         if (!WXIsWeixinScheme(scheme)) {
-            if ([scheme.lowercaseString isEqualToString:@"https"] && [WXWeChatLinkHosts() containsObject:host.lowercaseString]) {
-                WXLOG(@"  注意：这是微信相关 https 链接（可能走 Universal Link），暂不接管");
-            }
+            WXLOG(@"★ 命中微信 https 链接（Universal Link），无法强制指定 App，仅记录：%@", url.absoluteString);
             return NO;
         }
         NSArray *cands = WXCandidatesForURL(url);
@@ -486,7 +536,7 @@ static BOOL (*o_lsw_openURL_bid_unlock)(id, SEL, NSURL *, id, BOOL) = NULL;
 
 static BOOL h_app_canOpenURL(id self, SEL _cmd, NSURL *url) {
     BOOL r = o_app_canOpenURL ? o_app_canOpenURL(self, _cmd, url) : NO;
-    if (!gWXBusy && WXIsWeixinScheme(url.scheme)) WXLOG(@"CAN canOpenURL %@ -> %d", url.scheme, r);
+    if (!gWXBusy && WXIsTargetURL(url)) WXLOG(@"CAN canOpenURL %@ -> %d", url.absoluteString, r);
     return r;
 }
 
@@ -623,7 +673,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
 static BOOL h_router_openURL(id self, SEL _cmd, NSURL *url) {
     @try {
         WXLOG(@"[HFOpenURLRouter openURL:] %@", url.absoluteString);
-        if (!gWXBusy && url && WXIsWeixinScheme(url.scheme) && !WXIsSelfWeChat()) {
+        if (!gWXBusy && url && WXIsTargetURL(url) && !WXIsSelfWeChat()) {
             NSURL *u = url;
             WXSBShowChooser(u, @"openURL:", ^{
                 if (o_router_openURL) o_router_openURL(self, _cmd, u);
@@ -639,7 +689,7 @@ static BOOL h_router_openURL(id self, SEL _cmd, NSURL *url) {
 static BOOL h_router_openSensitive(id self, SEL _cmd, NSURL *url) {
     @try {
         WXLOG(@"[HFOpenURLRouter openSensitiveURL:] %@", url.absoluteString);
-        if (!gWXBusy && url && WXIsWeixinScheme(url.scheme) && !WXIsSelfWeChat()) {
+        if (!gWXBusy && url && WXIsTargetURL(url) && !WXIsSelfWeChat()) {
             NSURL *u = url;
             WXSBShowChooser(u, @"openSensitiveURL:", ^{
                 if (o_router_openSensitive) o_router_openSensitive(self, _cmd, u);
@@ -683,14 +733,30 @@ __attribute__((constructor)) static void WXInit(void) {
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                         WXDarwinCallback, CFSTR("com.fengxin.wxchooser.launch"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        for (NSString *nm in @[@"com.fengxin.wxchooser.loaded.chinaunicom",
+                               @"com.fengxin.wxchooser.loaded.umbra",
+                               @"com.fengxin.wxchooser.loaded.safariview",
+                               @"com.fengxin.wxchooser.loaded.webcontent",
+                               @"com.fengxin.wxchooser.loaded.safari",
+                               @"com.fengxin.wxchooser.loaded.lsd"]) {
+            CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                            WXPingCallback, (__bridge CFStringRef)nm,
+                                            NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        }
         WXLoadSBS();
-        WXLOG(@"SB: 已注册代办启动监听");
+        WXLOG(@"SB: 已注册代办启动监听 + 报到监听");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             WXInstallRouterHooks();
+        });
+    } else {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            WXPostLoadedPing();
+            WXLOG(@"已向 SB 报到：%@", WXSelfBundleID());
         });
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         WXInstallHooks();
+        if ([WXSelfBundleID() containsString:@"WebKit"]) return;
         if (!WXIsSelfWeChat()) {
             @try {
                 NSArray *all = WXScanWeChatApps();
