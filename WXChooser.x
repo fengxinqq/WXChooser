@@ -253,8 +253,10 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
     UIViewController *top = WXTopViewController();
     if (!top) { WXLOG(@"找不到顶层控制器，直接放行"); completion(YES); return; }
 
+    NSString *msg = cands.count ? @"选择要跳转的微信"
+                                : @"没识别到微信 App（可先点“系统默认”继续）";
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"打开微信"
-                                                               message:@"选择要跳转的微信"
+                                                               message:msg
                                                         preferredStyle:UIAlertControllerStyleActionSheet];
     for (NSDictionary *cand in cands) {
         NSString *title = cand[@"name"] ?: cand[@"bid"];
@@ -304,7 +306,6 @@ static BOOL WXTryIntercept(NSURL *url, NSDictionary *options, void (^completion)
         NSArray *cands = WXCandidatesForURL(url);
         WXLOG(@"拦截 %@ 候选 %lu 个", url.absoluteString, (unsigned long)cands.count);
         for (NSDictionary *c in cands) WXLOG(@"  候选：%@ %@ scheme=%@ wxScheme=%@", c[@"bid"], c[@"name"], c[@"scheme"] ?: @"(无)", c[@"wxScheme"] ?: @"(无)");
-        if (cands.count < 2) return NO;
         dispatch_async(dispatch_get_main_queue(), ^{
             WXPresentChooser(url, cands, options, completion);
         });
@@ -388,6 +389,34 @@ static BOOL h_ext_openURL(id self, SEL _cmd, NSURL *url, void (^cb)(BOOL)) {
     return r;
 }
 
+static BOOL (*o_app_canOpenURL)(id, SEL, NSURL *) = NULL;
+static BOOL (*o_lsw_openURL_bid)(id, SEL, NSURL *, id) = NULL;
+static BOOL (*o_lsw_openURL_bid_unlock)(id, SEL, NSURL *, id, BOOL) = NULL;
+
+static BOOL h_app_canOpenURL(id self, SEL _cmd, NSURL *url) {
+    BOOL r = o_app_canOpenURL ? o_app_canOpenURL(self, _cmd, url) : NO;
+    if (!gWXBusy && WXIsWeixinScheme(url.scheme)) WXLOG(@"CAN canOpenURL %@ -> %d", url.scheme, r);
+    return r;
+}
+
+static BOOL h_lsw_openURL_bid(id self, SEL _cmd, NSURL *url, id bid) {
+    if (WXTryIntercept(url, @{}, nil, [NSString stringWithFormat:@"LSWorkspace openURL:withBundleIdentifier: %@", bid])) return YES;
+    if (!o_lsw_openURL_bid) return NO;
+    gWXBusy = YES;
+    BOOL r = o_lsw_openURL_bid(self, _cmd, url, bid);
+    gWXBusy = NO;
+    return r;
+}
+
+static BOOL h_lsw_openURL_bid_unlock(id self, SEL _cmd, NSURL *url, id bid, BOOL allow) {
+    if (WXTryIntercept(url, @{}, nil, [NSString stringWithFormat:@"LSWorkspace openURL:withBundleIdentifier:allowUnlock: %@", bid])) return YES;
+    if (!o_lsw_openURL_bid_unlock) return NO;
+    gWXBusy = YES;
+    BOOL r = o_lsw_openURL_bid_unlock(self, _cmd, url, bid, allow);
+    gWXBusy = NO;
+    return r;
+}
+
 static void WXInstallHook(Class cls, NSString *selName, IMP newImp, IMP *outOrig, NSString *tag) {
     if (!cls) { WXLOG(@"挂钩跳过：类不存在 %@", tag); return; }
     SEL sel = NSSelectorFromString(selName);
@@ -408,6 +437,7 @@ static void WXInstallHooks(void) {
         WXInstallHook(app, @"openURL:options:completionHandler:", (IMP)h_app_openURL_opts, (IMP *)&o_app_openURL_opts, @"UIApplication openURL:options:completionHandler:");
         WXInstallHook(app, @"openURL:", (IMP)h_app_openURL, (IMP *)&o_app_openURL, @"UIApplication openURL:");
         WXInstallHook(app, @"_openURL:options:", (IMP)h_app__openURL_opts, (IMP *)&o_app__openURL_opts, @"UIApplication _openURL:options:");
+        WXInstallHook(app, @"canOpenURL:", (IMP)h_app_canOpenURL, (IMP *)&o_app_canOpenURL, @"UIApplication canOpenURL:");
         Class ext = NSClassFromString(@"NSExtensionContext");
         WXInstallHook(ext, @"openURL:completionHandler:", (IMP)h_ext_openURL, (IMP *)&o_ext_openURL, @"NSExtensionContext openURL:completionHandler:");
     }
@@ -418,6 +448,8 @@ static void WXInstallHooks(void) {
             WXInstallHook(lsw, @"openURL:", (IMP)h_lsw_openURL, (IMP *)&o_lsw_openURL, @"LSWorkspace openURL:");
             WXInstallHook(lsw, @"openURL:withOptions:", (IMP)h_lsw_openURL_opts, (IMP *)&o_lsw_openURL_opts, @"LSWorkspace openURL:withOptions:");
             WXInstallHook(lsw, @"openSensitiveURL:withOptions:", (IMP)h_lsw_openSensitive, (IMP *)&o_lsw_openSensitive, @"LSWorkspace openSensitiveURL:withOptions:");
+            WXInstallHook(lsw, @"openURL:withBundleIdentifier:", (IMP)h_lsw_openURL_bid, (IMP *)&o_lsw_openURL_bid, @"LSWorkspace openURL:withBundleIdentifier:");
+            WXInstallHook(lsw, @"openURL:withBundleIdentifier:allowUnlock:", (IMP)h_lsw_openURL_bid_unlock, (IMP *)&o_lsw_openURL_bid_unlock, @"LSWorkspace openURL:withBundleIdentifier:allowUnlock:");
         }
     }
 }
@@ -425,7 +457,16 @@ static void WXInstallHooks(void) {
 __attribute__((constructor)) static void WXInit(void) {
     WXLOG(@"LOADED in %@ (%@)", WXSelfBundleID(), WXIsSelfWeChat() ? @"微信本体" : @"其他进程");
     WXInstallHooks();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         WXInstallHooks();
+        if (!WXIsSelfWeChat()) {
+            @try {
+                NSArray *all = WXScanWeChatApps();
+                WXLOG(@"自检：识别到 %lu 个微信类应用", (unsigned long)all.count);
+                for (NSDictionary *a in all) WXLOG(@"  自检候选：%@ %@ schemes=%@", a[@"bid"], a[@"name"], a[@"schemes"]);
+            } @catch (NSException *e) {
+                WXLOG(@"自检异常 %@", e.reason);
+            }
+        }
     });
 }
