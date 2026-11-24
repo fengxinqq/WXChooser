@@ -2,11 +2,16 @@ name: build
 on: [push, workflow_dispatch]
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - name: deps
-        run: brew install ldid xz dpkg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make xz-utils libtinfo5 zlib1g-dev curl xz-utils
+          curl -sL https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_macosx_arm64 -o /tmp/x || true
+          curl -sL https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -o /tmp/ldid && sudo mv /tmp/ldid /usr/local/bin/ldid && sudo chmod +x /usr/local/bin/ldid
+          ldid -v || true
       - name: theos
         run: |
           git clone --recursive --depth 1 https://github.com/roothide/theos ~/theos
