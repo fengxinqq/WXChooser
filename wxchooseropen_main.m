@@ -58,7 +58,7 @@ int main(int argc, char **argv) {
     }
     LG(@"LSWorkspace 可选：%@", [openSels componentsJoinedByString:@" | "]);
 
-    void *sb = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
+    (void)(dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY));
     int (*sbsURL)(CFStringRef, CFURLRef, CFDictionaryRef, CFStringRef *, Boolean) =
         (int (*)(CFStringRef, CFURLRef, CFDictionaryRef, CFStringRef *, Boolean))dlsym(RTLD_DEFAULT, "SBSLaunchApplicationWithIdentifierAndURLAndLaunchOptions");
     int (*sbs)(CFStringRef, Boolean) = (int (*)(CFStringRef, Boolean))dlsym(RTLD_DEFAULT, "SBSLaunchApplicationWithIdentifier");
