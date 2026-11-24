@@ -443,6 +443,11 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
 // 返回 YES 表示已经由本插件接管（调用方应直接返回成功）
 static BOOL WXTryIntercept(NSURL *url, NSDictionary *options, void (^completion)(BOOL), NSString *entry) {
     if (gWXBusy) return NO;
+    // 只在 SpringBoard 里弹框；App 进程内一律放行，避免重复弹框与进程内拉起导致崩溃
+    if (![WXSelfBundleID() isEqualToString:@"com.apple.springboard"]) {
+        WXLOG(@"[%@] 非 SpringBoard，直接放行 %@", entry, url.absoluteString);
+        return NO;
+    }
     @try {
         if (!url) return NO;
         NSString *scheme = url.scheme ?: @"";
@@ -682,16 +687,20 @@ static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
     @try {
         if (!bid.length) return NO;
         gWXBusy = YES;
-        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 8.0;
+        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 14.0;
 
         if ([bid isEqualToString:@"com.tencent.xin"] && gWXPendingReq) {
             BOOL ok = WXReplayPending();
             WXLOG(@"重放结果 %d", ok);
             if (ok) {
                 if (url) {
-                    WXLOG(@"重放后补送支付 URL %@", url.absoluteString);
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        WXLSAsyncOpen(nil, url);
+                    WXLOG(@"重放成功，1 秒后由启动器补送票据 %@", url.absoluteString);
+                    NSString *bidCopy = [bid copy];
+                    NSURL *urlCopy = [url copy];
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                            WXSBLaunchByBundle(urlCopy, bidCopy);
+                        });
                     });
                 }
                 gWXBusy = NO;
@@ -699,14 +708,6 @@ static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
             }
         }
 
-        // 先在 SpringBoard 进程内异步拉起，2 秒内没回调再走外部启动器兜底
-        gWXLSFired = NO;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            WXLSAsyncOpen(bid, ([bid isEqualToString:@"com.tencent.xin"] ? url : nil));
-        });
-
-        usleep(700 * 1000);
-        if (gWXLSFired) { WXLOG(@"LS 已回调，不做外部兜底"); gWXBusy = NO; return YES; }
 
         NSMutableArray *paths = [NSMutableArray array];
         NSString *selfPath = WXOpenerPath();
