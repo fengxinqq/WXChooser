@@ -67,6 +67,8 @@ static NSArray<NSString *> *WXSchemesOfPlist(NSDictionary *pl) {
     return out;
 }
 
+static NSArray<NSDictionary *> *WXScanViaLSWorkspace(void);
+
 static NSArray<NSDictionary *> *WXScanWeChatApps(void) {
     NSMutableArray *out = [NSMutableArray array];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -89,6 +91,7 @@ static NSArray<NSDictionary *> *WXScanWeChatApps(void) {
         }
     } @catch (NSException *e) {}
 
+    WXLOG(@"文件扫描得到 %lu 个 app 路径", (unsigned long)appPaths.count);
     for (NSString *p in appPaths) {
         NSDictionary *pl = [NSDictionary dictionaryWithContentsOfFile:[p stringByAppendingPathComponent:@"Info.plist"]];
         if (![pl isKindOfClass:[NSDictionary class]]) continue;
@@ -99,6 +102,33 @@ static NSArray<NSDictionary *> *WXScanWeChatApps(void) {
         if (!WXIsWeChatApp(bid, name)) continue;
         NSArray *schemes = WXSchemesOfPlist(pl);
         [out addObject:@{@"bid": bid, @"name": name, @"schemes": schemes}];
+    }
+    if (out.count == 0) {
+        WXLOG(@"文件系统扫不到，改用 LaunchServices");
+        out = [WXScanViaLSWorkspace() mutableCopy];
+    }
+    return out;
+}
+
+static NSArray<NSDictionary *> *WXScanViaLSWorkspace(void) {
+    NSMutableArray *out = [NSMutableArray array];
+    Class cls = NSClassFromString(@"LSApplicationWorkspace");
+    if (!cls) { WXLOG(@"LSW: 类不存在"); return out; }
+    @try {
+        id ws = ((id (*)(id, SEL))objc_msgSend)(cls, @selector(defaultWorkspace));
+        id apps = ((id (*)(id, SEL))objc_msgSend)(ws, @selector(allInstalledApplications));
+        if (![apps isKindOfClass:[NSArray class]]) { WXLOG(@"LSW: 应用列表拿不到"); return out; }
+        for (id proxy in (NSArray *)apps) {
+            NSString *bid = nil, *name = nil;
+            @try { bid = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(bundleIdentifier)); } @catch (NSException *e) {}
+            @try { name = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(localizedName)); } @catch (NSException *e) {}
+            if (!bid.length) continue;
+            if (!WXIsWeChatApp(bid, name)) continue;
+            [out addObject:@{@"bid": bid, @"name": name.length ? name : bid, @"schemes": @[]}];
+        }
+        WXLOG(@"LSW: 枚举到 %lu 个微信类应用", (unsigned long)out.count);
+    } @catch (NSException *e) {
+        WXLOG(@"LSW 异常 %@", e.reason);
     }
     return out;
 }
