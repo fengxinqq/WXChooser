@@ -645,6 +645,39 @@ static NSString *WXOpenerPath(void) {
     return cached;
 }
 
+static volatile BOOL gWXLSFired = NO;
+
+// 在 SpringBoard 进程内异步拉起（LS 工作区，无外部进程、无同步等待，不阻塞主线程）
+static void WXLSAsyncOpen(NSString *bid, NSURL *url) {
+    @try {
+        Class c = NSClassFromString(@"LSApplicationWorkspace");
+        if (!c) { WXLOG(@"LS 工作区类缺失"); return; }
+        id ws = ((id (*)(id, SEL))objc_msgSend)(c, sel_getUid("defaultWorkspace"));
+        if (!ws) { WXLOG(@"LS 工作区实例缺失"); return; }
+        if (url) {
+            SEL s = sel_getUid("openURL:configuration:completionHandler:");
+            if ([ws respondsToSelector:s]) {
+                ((void (*)(id, SEL, id, id, id))objc_msgSend)(ws, s, url, nil, ^(id x, NSError *e) {
+                    gWXLSFired = YES;
+                    WXLOG(@"LS 开URL 回调 ok=%@ err=%@", x ?: @"nil", e.localizedDescription ?: @"无");
+                });
+                WXLOG(@"LS 异步开URL 已提交 %@", url.absoluteString);
+                return;
+            }
+        }
+        SEL s2 = sel_getUid("openApplicationWithBundleIdentifier:configuration:completionHandler:");
+        if ([ws respondsToSelector:s2]) {
+            ((void (*)(id, SEL, id, id, id))objc_msgSend)(ws, s2, bid, nil, ^(id x, NSError *e) {
+                gWXLSFired = YES;
+                WXLOG(@"LS 开包 回调 ok=%@ err=%@", x ?: @"nil", e.localizedDescription ?: @"无");
+            });
+            WXLOG(@"LS 异步开包 已提交 %@", bid);
+            return;
+        }
+        WXLOG(@"LS 无异步接口");
+    } @catch (NSException *e) { WXLOG(@"LS 异步拉起异常 %@", e.reason); }
+}
+
 static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
     @try {
         if (!bid.length) return NO;
@@ -656,6 +689,15 @@ static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
             WXLOG(@"重放结果 %d", ok);
             if (ok) { gWXBusy = NO; return YES; }
         }
+
+        // 先在 SpringBoard 进程内异步拉起，2 秒内没回调再走外部启动器兜底
+        gWXLSFired = NO;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            WXLSAsyncOpen(bid, ([bid isEqualToString:@"com.tencent.xin"] ? url : nil));
+        });
+
+        usleep(700 * 1000);
+        if (gWXLSFired) { WXLOG(@"LS 已回调，不做外部兜底"); gWXBusy = NO; return YES; }
 
         NSMutableArray *paths = [NSMutableArray array];
         NSString *selfPath = WXOpenerPath();

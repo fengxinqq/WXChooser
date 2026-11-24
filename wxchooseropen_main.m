@@ -28,12 +28,20 @@ static id WSObj(void) {
     return ((id (*)(id, SEL))objc_msgSend)(c, sel_getUid("defaultWorkspace"));
 }
 
-static BOOL callSEL(id obj, NSString *selName, id a1, id a2) {
+static id FBSvc(void) {
+    Class c = NSClassFromString(@"FBSSystemService");
+    if (!c) return nil;
+    SEL s = sel_getUid("sharedService");
+    if (![c respondsToSelector:s]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(c, s);
+}
+
+static BOOL callBOOL(id obj, NSString *selName, id a1, id a2) {
     SEL s = sel_getUid(selName.UTF8String);
-    if (!obj || ![obj respondsToSelector:s]) return NO;
-    BOOL ok = ((BOOL (*)(id, SEL, id, id))objc_msgSend)(obj, s, a1, a2);
-    LG(@"%@ -> %d", selName, ok);
-    return ok;
+    if (!obj || ![obj respondsToSelector:s]) { LG(@"%@ 不存在", selName); return NO; }
+    NSInteger ok = ((BOOL (*)(id, SEL, id, id))objc_msgSend)(obj, s, a1, a2);
+    LG(@"%@ 返回 %ld", selName, (long)ok);
+    return ok ? YES : NO;
 }
 
 // 在独立线程执行，最多等 timeout 秒，卡住也不会毁掉整个启动器
@@ -54,6 +62,35 @@ static NSInteger runWithTimeout(NSString *name, double timeout, BOOL (^blk)(void
     return val;
 }
 
+// FrontBoard 系统服务打开（系统级，最可靠的一条）
+static BOOL openViaFBSSystem(NSString *bid, NSURL *url) {
+    id svc = FBSvc();
+    if (!svc) { LG(@"FBSSystemService 不存在"); return NO; }
+    NSMutableDictionary *opts = [NSMutableDictionary dictionary];
+    if (url) {
+        for (NSString *k in @[@"FBSOpenApplicationOptionKeyPayloadURL", @"FBSOpenApplicationOptionKeyLaunchURL"]) {
+            @try { opts[k] = url; } @catch (NSException *e) {}
+        }
+    }
+    __block BOOL fired = NO;
+    SEL s = sel_getUid("openApplication:options:withResult:");
+    if ([svc respondsToSelector:s]) {
+        ((void (*)(id, SEL, id, id, id))objc_msgSend)(svc, s, bid, opts, ^(NSError *e, id r) {
+            fired = YES;
+            LG(@"FBS 回调 err=%@ r=%@", e.localizedDescription ?: @"无", r ?: @"nil");
+        });
+        NSInteger rr = runWithTimeout(@"FBS openApplication", 5.0, ^{ return (BOOL)fired; });
+        return (rr == 0);
+    }
+    LG(@"FBS openApplication:options:withResult: 不存在");
+    SEL s2 = sel_getUid("openApplication:withOptions:");
+    if ([svc respondsToSelector:s2]) {
+        ((void (*)(id, SEL, id, id))objc_msgSend)(svc, s2, bid, opts);
+        return YES;
+    }
+    return NO;
+}
+
 int main(int argc, char **argv) {
     __block NSInteger r = -999;
     __block NSString *how = @"无";
@@ -72,52 +109,42 @@ int main(int argc, char **argv) {
         LG(@"收到 bid=%@ url=%@", bid, urlStr);
 
         id ws = WSObj();
-        LG(@"工作区=%@", ws ? NSStringFromClass([ws class]) : @"(空)");
-        Class cfgCls = NSClassFromString(@"LSApplicationOpenConfiguration");
-        LG(@"配置类=%@", cfgCls ? NSStringFromClass(cfgCls) : @"(空)");
+        LG(@"工作区=%@ FBS=%@", ws ? NSStringFromClass([ws class]) : @"(空)", FBSvc() ? @"有" : @"无");
 
-        // 1) 带 URL + 目标包名的配置打开
-        r = runWithTimeout(@"openURL:configuration:", 4.0, ^{
-            if (!cfgCls) { LG(@"本机没有配置类，跳过这条路径"); return NO; }
-            id cfg = ((id (*)(id, SEL))objc_msgSend)(cfgCls, sel_getUid("new"));
-            for (NSString *k in @[@"targetApplicationBundleIdentifier", @"applicationBundleIdentifier", @"bundleIdentifier"]) {
-                @try { [cfg setValue:bid forKey:k]; LG(@"配置写入 %@ 成功", k); break; }
-                @catch (NSException *e) { LG(@"配置写入 %@ 失败", k); }
-            }
-            SEL s = sel_getUid("openURL:configuration:completionHandler:");
-            if (ws && [ws respondsToSelector:s]) {
-                ((void (*)(id, SEL, id, id, id))objc_msgSend)(ws, s, url, cfg, ^(id x, NSError *e) {
-                    LG(@"openURL 回调 ok=%@ err=%@", x ?: @"nil", e.localizedDescription ?: @"无");
-                });
-                return YES;
-            }
-            LG(@"没有 openURL:configuration: 方法");
-            return NO;
-        });
-        if (r == 0) how = @"openURL+配置";
+        // 1) FrontBoard 系统服务按包名拉起
+        r = runWithTimeout(@"FBS", 6.0, ^{ return openViaFBSSystem(bid, nil); });
+        if (r == 0) how = @"FBS 系统服务";
 
-        // 2) 按包名启动（配置对象可选）
+        // 2) LSApplicationWorkspace 同步按包名
         if (r != 0) {
-            r = runWithTimeout(@"openApplicationWithBundleIdentifier:", 4.0, ^{
-                SEL s = sel_getUid("openApplicationWithBundleIdentifier:configuration:completionHandler:");
-                if (ws && [ws respondsToSelector:s]) {
-                    ((void (*)(id, SEL, id, id, id))objc_msgSend)(ws, s, bid, nil, ^(id x, NSError *e) {
-                        LG(@"按包名回调 ok=%@ err=%@", x ?: @"nil", e.localizedDescription ?: @"无");
-                    });
-                    return YES;
-                }
-                if (!callSEL(ws, @"openApplicationWithBundleID:", bid, nil)) return NO;
-                return YES;
+            r = runWithTimeout(@"openApplicationWithBundleID:", 4.0, ^{
+                return callBOOL(ws, @"openApplicationWithBundleID:", bid, nil);
             });
             if (r == 0) how = @"按包名";
         }
 
-        // 3) 普通 openURL（只有官方微信会命中）
+        // 3) LSApplicationWorkspace 带 URL 打开（敏感 URL 优先）
+        if (r != 0 && url) {
+            r = runWithTimeout(@"openSensitiveURL:withOptions:", 4.0, ^{
+                SEL s = sel_getUid("openSensitiveURL:withOptions:");
+                if (![ws respondsToSelector:s]) return NO;
+                BOOL ok = ((BOOL (*)(id, SEL, id, id))objc_msgSend)(ws, s, url, nil);
+                LG(@"openSensitiveURL:withOptions: 返回 %d", ok);
+                return ok;
+            });
+            if (r == 0) how = @"openSensitiveURL";
+        }
         if (r != 0 && url) {
             r = runWithTimeout(@"openURL:", 3.0, ^{
-                return callSEL(ws, @"openURL:", url, nil);
+                return callBOOL(ws, @"openURL:", url, nil);
             });
             if (r == 0) how = @"openURL";
+        }
+
+        // 4) 带 URL 的 FBS 系统服务
+        if (r != 0 && url) {
+            r = runWithTimeout(@"FBS+URL", 6.0, ^{ return openViaFBSSystem(bid, url); });
+            if (r == 0) how = @"FBS+URL";
         }
 
         LG(@"最终 how=%@ r=%ld", how, (long)r);
