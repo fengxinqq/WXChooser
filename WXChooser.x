@@ -687,7 +687,16 @@ static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
         if ([bid isEqualToString:@"com.tencent.xin"] && gWXPendingReq) {
             BOOL ok = WXReplayPending();
             WXLOG(@"重放结果 %d", ok);
-            if (ok) { gWXBusy = NO; return YES; }
+            if (ok) {
+                if (url) {
+                    WXLOG(@"重放后补送支付 URL %@", url.absoluteString);
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        WXLSAsyncOpen(nil, url);
+                    });
+                }
+                gWXBusy = NO;
+                return YES;
+            }
         }
 
         // 先在 SpringBoard 进程内异步拉起，2 秒内没回调再走外部启动器兜底
