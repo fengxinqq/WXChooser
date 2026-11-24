@@ -998,6 +998,12 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
                 if (sb2) { bid = sb2; bidKnown = YES; WXLOG(@"  深度扫描到目标包：%@", sb2); }
             }
             NSString *desc = nil;
+            static int dbgCount = 0;
+            if (!looksWX && dbgCount < 150) {
+                dbgCount++;
+                if (!desc) { @try { desc = [request description]; } @catch (NSException *e) {} }
+                if (desc.length) WXLOG(@"  事务样本 %@", [desc substringToIndex:MIN(desc.length, 150u)]);
+            }
             BOOL looksWX = bidKnown;
             if (!looksWX) {
                 @try { desc = [request description]; } @catch (NSException *e) {}
