@@ -4,6 +4,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <unistd.h>
+#import <stdarg.h>
 
 static NSString *const kLog = @"/var/mobile/wxchooser.log";
 static void LG(NSString *fmt, ...) {
@@ -24,7 +25,10 @@ static void LG(NSString *fmt, ...) {
 }
 
 int main(int argc, char **argv) {
-    NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+    __block NSInteger r = -999;
+    __block NSString *how = @"无";
+    __block NSString *errS = @"无";
+    @autoreleasepool {
     NSString *cmdPath = @"/var/mobile/wxchooser_cmd.plist";
     NSDictionary *cmd = nil;
     for (int i = 0; i < 25 && ![cmd isKindOfClass:[NSDictionary class]]; i++) {
@@ -59,9 +63,6 @@ int main(int argc, char **argv) {
         (int (*)(CFStringRef, CFURLRef, CFDictionaryRef, CFStringRef *, Boolean))dlsym(RTLD_DEFAULT, "SBSLaunchApplicationWithIdentifierAndURLAndLaunchOptions");
     int (*sbs)(CFStringRef, Boolean) = (int (*)(CFStringRef, Boolean))dlsym(RTLD_DEFAULT, "SBSLaunchApplicationWithIdentifier");
 
-    __block NSInteger r = -999;
-    __block NSString *how = @"无";
-    __block NSString *errS = @"无";
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
@@ -92,6 +93,6 @@ int main(int argc, char **argv) {
     LG(@"结果 how=%@ r=%ld err=%@ 超时=%d", how, (long)r, errS, waited != 0);
 
     [[NSFileManager defaultManager] removeItemAtPath:cmdPath error:nil];
-    [pool release];
+    }
     return (r == 0) ? 0 : 1;
 }
