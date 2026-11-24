@@ -2,6 +2,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <dlfcn.h>
 
 static NSString *const kWXLogPath = @"/var/mobile/wxchooser.log";
 
@@ -70,6 +71,16 @@ static NSArray<NSString *> *WXSchemesOfPlist(NSDictionary *pl) {
 
 static NSArray<NSDictionary *> *WXScanViaLSWorkspace(void);
 
+static BOOL WXIsStrictWeChatScheme(NSString *scheme) {
+    NSString *s = scheme.lowercaseString;
+    if (!s.length) return NO;
+    if ([s containsString:@"."]) return NO;   // 形如 weixin.chinaunicom.com 的是别人的私有 scheme
+    if ([s isEqualToString:@"weixin"] || [s isEqualToString:@"wechat"]) return YES;
+    if ([s hasPrefix:@"weixin"]) return YES;
+    if ([s hasPrefix:@"wx"] && s.length > 2) return YES;
+    return NO;
+}
+
 // 是否可能是微信类应用：包名像微信，或显示名含「微信」
 static BOOL WXLooksLikeWeChat(NSString *bid, NSString *name, NSArray<NSString *> *schemes) {
     NSString *b = bid.lowercaseString ?: @"";
@@ -79,8 +90,7 @@ static BOOL WXLooksLikeWeChat(NSString *bid, NSString *name, NSArray<NSString *>
     if ([b containsString:@"wechat"]) return YES;
     if ([n containsString:@"微信"]) return YES;
     for (NSString *s in schemes) {
-        NSString *low = s.lowercaseString;
-        if ([low isEqualToString:@"weixin"] || [low hasPrefix:@"weixin"]) return YES;
+        if (WXIsStrictWeChatScheme(s)) return YES;
     }
     return NO;
 }
@@ -219,6 +229,17 @@ static BOOL WXOpenByScheme(NSURL *url, NSString *scheme, void (^done)(BOOL)) {
     return YES;
 }
 
+static BOOL WXRequestSpringBoardLaunch(NSURL *url, NSString *bid) {
+    NSDictionary *req = @{ @"bid": bid ?: @"",
+                           @"url": url.absoluteString ?: @"" };
+    BOOL wrote = [req writeToFile:@"/var/mobile/wxchooser_req.plist" atomically:YES];
+    WXLOG(@"向 SpringBoard 发启动请求（写文件=%d）bid=%@ url=%@", wrote, bid, url.absoluteString);
+    if (!wrote) return NO;
+    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                         CFSTR("com.fengxin.wxchooser.launch"), NULL, NULL, true);
+    return YES;
+}
+
 static BOOL WXOpenByBundleID(NSURL *url, NSString *bid, void (^done)(BOOL)) {
     Class lswCls = NSClassFromString(@"LSApplicationWorkspace");
     if (!lswCls) { WXLOG(@"没有 LSApplicationWorkspace"); return NO; }
@@ -249,6 +270,44 @@ static BOOL WXOpenByBundleID(NSURL *url, NSString *bid, void (^done)(BOOL)) {
     return NO;
 }
 
+#pragma mark - SpringBoard 代办启动
+
+static int (*gSBSLaunchWithURL)(CFStringRef, CFURLRef, CFDictionaryRef, CFStringRef *, Boolean) = NULL;
+static int (*gSBSLaunch)(CFStringRef, Boolean) = NULL;
+
+static void WXLoadSBS(void) {
+    if (gSBSLaunchWithURL || gSBSLaunch) return;
+    dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_NOW);
+    gSBSLaunchWithURL = (int (*)(CFStringRef, CFURLRef, CFDictionaryRef, CFStringRef *, Boolean))dlsym(RTLD_DEFAULT, "SBSLaunchApplicationWithIdentifierAndURLAndLaunchOptions");
+    gSBSLaunch = (int (*)(CFStringRef, Boolean))dlsym(RTLD_DEFAULT, "SBSLaunchApplicationWithIdentifier");
+    WXLOG(@"SBS 接口：withURL=%s launch=%s", gSBSLaunchWithURL ? "有" : "无", gSBSLaunch ? "有" : "无");
+}
+
+static void WXHandleLaunchRequest(void) {
+    NSString *path = @"/var/mobile/wxchooser_req.plist";
+    NSDictionary *req = [NSDictionary dictionaryWithContentsOfFile:path];
+    if (![req isKindOfClass:[NSDictionary class]]) { WXLOG(@"SB: 读不到请求文件"); return; }
+    NSString *bid = req[@"bid"], *us = req[@"url"];
+    NSURL *u = us.length ? [NSURL URLWithString:us] : nil;
+    WXLOG(@"SB: 收到请求 bid=%@ url=%@", bid, us);
+    WXLoadSBS();
+    if (gSBSLaunchWithURL && bid.length) {
+        CFStringRef err = NULL;
+        int r = gSBSLaunchWithURL((__bridge CFStringRef)bid, (__bridge CFURLRef)u,
+                                  (__bridge CFDictionaryRef)@{}, &err, false);
+        WXLOG(@"SB: SBSLaunchWithURL bid=%@ r=%d err=%@", bid, r, err ? (__bridge NSString *)err : @"无");
+        if (err) CFRelease(err);
+    } else if (gSBSLaunch && bid.length) {
+        int r = gSBSLaunch((__bridge CFStringRef)bid, false);
+        WXLOG(@"SB: SBSLaunch bid=%@ r=%d", bid, r);
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+}
+
+static void WXDarwinCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    dispatch_async(dispatch_get_main_queue(), ^{ WXHandleLaunchRequest(); });
+}
+
 static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDictionary *options, void (^completion)(BOOL)) {
     UIViewController *top = WXTopViewController();
     if (!top) { WXLOG(@"找不到顶层控制器，直接放行"); completion(YES); return; }
@@ -266,9 +325,10 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
             if (scheme.length) handled = WXOpenByScheme(url, scheme, ^(BOOL ok) {
                 if (!ok) WXLOG(@"scheme 方式打开失败：%@", scheme);
             });
+            if (!handled) handled = WXRequestSpringBoardLaunch(url, cand[@"bid"]);
             if (!handled) handled = WXOpenByBundleID(url, cand[@"bid"], nil);
             if (!handled) {
-                WXLOG(@"两种方式都失败，回退系统默认，目标=%@", cand[@"bid"]);
+                WXLOG(@"几种方式都失败，回退系统默认，目标=%@", cand[@"bid"]);
                 WXOpenPassthrough(url, options, completion);
             } else if (completion) {
                 completion(YES);
@@ -457,6 +517,13 @@ static void WXInstallHooks(void) {
 __attribute__((constructor)) static void WXInit(void) {
     WXLOG(@"LOADED in %@ (%@)", WXSelfBundleID(), WXIsSelfWeChat() ? @"微信本体" : @"其他进程");
     WXInstallHooks();
+    if ([WXSelfBundleID() isEqualToString:@"com.apple.springboard"]) {
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        WXDarwinCallback, CFSTR("com.fengxin.wxchooser.launch"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        WXLoadSBS();
+        WXLOG(@"SB: 已注册代办启动监听");
+    }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         WXInstallHooks();
         if (!WXIsSelfWeChat()) {
