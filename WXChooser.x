@@ -5,6 +5,8 @@
 #import <dlfcn.h>
 #import <spawn.h>
 #import <fcntl.h>
+#import <errno.h>
+#import <string.h>
 #import <sys/wait.h>
 #import <stdio.h>
 #import <sys/stat.h>
@@ -618,48 +620,56 @@ static BOOL (*o_router_openURL)(id, SEL, NSURL *) = NULL;
 static BOOL (*o_router_openSensitive)(id, SEL, NSURL *) = NULL;
 
 // 不再在 SpringBoard 进程里直接调 SBS（那会就地崩溃）。改为写命令文件 + 拉起独立启动器进程执行。
+static NSString *WXOpenerPath(void) {
+    // 启动器和宿主 dylib 同目录，用自身路径推导，绕开 roothide 虚拟根
+    static NSString *cached = nil;
+    if (cached) return cached;
+    @try {
+        void *sym = (void *)&WXWriteLog;
+        Dl_info info;
+        memset(&info, 0, sizeof(info));
+        if (dladdr(sym, &info) && info.dli_fname) {
+            NSString *me = [NSString stringWithUTF8String:info.dli_fname];
+            cached = [[me stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"wxchooseropen"];
+            WXLOG(@"自身路径 %@ → 启动器 %@", me, cached);
+        }
+    } @catch (NSException *e) {}
+    return cached;
+}
+
 static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
     @try {
         if (!bid.length) return NO;
         gWXBusy = YES;
-        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 6.0;
-        WXLoadSBS();
-        if (!gSBSLaunchWithURL && !gSBSLaunch) { WXLOG(@"启动接口都不可用"); gWXBusy = NO; return NO; }
+        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 8.0;
 
-        // 所有可能分配内存的动作都在 fork 之前完成，子进程里只做一次纯调用
-        CFStringRef cbid = (__bridge CFStringRef)bid;
-        CFURLRef curl = url ? (__bridge CFURLRef)url : NULL;
-        CFDictionaryRef copts = CFDictionaryCreate(NULL, NULL, NULL, 0,
-                                                   &kCFTypeDictionaryKeyCallBacks,
-                                                   &kCFTypeDictionaryValueCallBacks);
-        int fd = open("/var/mobile/wxchooser.log", O_WRONLY | O_APPEND);
-        pid_t pid = fork();
-        if (pid == 0) {
-            int r = -1;
-            if (gSBSLaunchWithURL) {
-                r = gSBSLaunchWithURL(cbid, curl, copts, NULL, false);
-            } else if (gSBSLaunch) {
-                r = gSBSLaunch(cbid, false);
-            }
-            if (fd >= 0) {
-                char buf[256];
-                int n = snprintf(buf, sizeof(buf), "[子进程 %d] 拉起 %s r=%d\n", (int)getpid(), bid.UTF8String, r);
-                if (n > 0) write(fd, buf, (size_t)n);
-                close(fd);
-            }
-            _exit(0);
+        NSMutableArray *paths = [NSMutableArray array];
+        NSString *selfPath = WXOpenerPath();
+        if (selfPath) [paths addObject:selfPath];
+        [paths addObject:@"/usr/bin/wxchooseropen"];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *bin = nil;
+        for (NSString *p in paths) {
+            BOOL exe = [fm isExecutableFileAtPath:p];
+            WXLOG(@"候选 %@ 可执行=%d", p, exe);
+            if (exe) { bin = p; break; }
         }
-        WXLOG(@"fork 结果 pid=%d（0 表示失败）", (int)pid);
-        if (fd >= 0) close(fd);
-        if (pid < 0) { gWXBusy = NO; return NO; }
+        if (!bin) { WXLOG(@"全部候选都不可执行"); gWXBusy = NO; return NO; }
+        [fm setAttributes:@{NSFilePosixPermissions:@(0755)} ofItemAtPath:bin error:nil];
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            int st = 0;
-            waitpid(pid, &st, WNOHANG);
-        });
+        NSString *cmdPath = @"/var/mobile/wxchooser_cmd.plist";
+        NSDictionary *cmd = @{ @"bid" : bid, @"url" : (url.absoluteString ?: @"") };
+        BOOL wrote = [cmd writeToFile:cmdPath atomically:YES];
+        WXLOG(@"命令文件 %@ 已写=%d", cmdPath, wrote);
+
+        const char *path = bin.UTF8String;
+        char *const argsv[] = { (char *)path, NULL };
+        char *const envv[] = { (char *)"PATH=/usr/bin:/bin:/usr/sbin:/sbin", (char *)"HOME=/var/mobile", NULL };
+        pid_t pid = 0;
+        int rc = posix_spawn(&pid, path, NULL, NULL, argsv, envv);
+        WXLOG(@"spawn %@ rc=%d errno=%d pid=%d", bin, rc, errno, (int)pid);
         gWXBusy = NO;
-        return YES;
+        return (rc == 0);
     } @catch (NSException *e) {
         gWXBusy = NO;
         WXLOG(@"拉起动作异常 %@", e.reason);
