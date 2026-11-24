@@ -1,4 +1,5 @@
 #import <UIKit/UIKit.h>
+#import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
@@ -21,6 +22,8 @@ static void WXWriteLog(NSString *line) {
 
 #define WXLOG(...) WXWriteLog([NSString stringWithFormat:__VA_ARGS__])
 
+static volatile BOOL gWXBusy = NO;
+
 static NSString *WXSelfBundleID(void) {
     static NSString *bid = nil;
     if (!bid) bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
@@ -29,7 +32,8 @@ static NSString *WXSelfBundleID(void) {
 
 static BOOL WXIsSelfWeChat(void) {
     NSString *b = WXSelfBundleID().lowercaseString;
-    return (b.length && [b containsString:@"tencent.xin"]) || [b containsString:@"weixin"] || [b containsString:@"wechat"];
+    if (!b.length) return NO;
+    return [b containsString:@"tencent.xin"] || [b containsString:@"weixin"] || [b containsString:@"wechat"];
 }
 
 static BOOL WXIsWeixinScheme(NSString *scheme) {
@@ -40,14 +44,11 @@ static BOOL WXIsWeixinScheme(NSString *scheme) {
     return NO;
 }
 
-static BOOL WXIsWeChatApp(NSString *bid, NSString *name) {
-    NSString *b = bid.lowercaseString ?: @"";
-    NSString *n = name ?: @"";
-    if ([b containsString:@"tencent.xin"]) return YES;
-    if ([b containsString:@"weixin"]) return YES;
-    if ([b containsString:@"wechat"]) return YES;
-    if ([n containsString:@"微信"]) return YES;
-    return NO;
+static NSSet<NSString *> *WXWeChatLinkHosts(void) {
+    static NSSet *set = nil;
+    if (!set) set = [NSSet setWithArray:@[@"weixin.qq.com", @"weixin110.qq.com", @"wx.qq.com",
+                                          @"help.wechat.com", @"open.weixin.qq.com"]];
+    return set;
 }
 
 static NSArray<NSString *> *WXSchemesOfPlist(NSDictionary *pl) {
@@ -68,6 +69,21 @@ static NSArray<NSString *> *WXSchemesOfPlist(NSDictionary *pl) {
 }
 
 static NSArray<NSDictionary *> *WXScanViaLSWorkspace(void);
+
+// 是否可能是微信类应用：包名像微信，或显示名含「微信」
+static BOOL WXLooksLikeWeChat(NSString *bid, NSString *name, NSArray<NSString *> *schemes) {
+    NSString *b = bid.lowercaseString ?: @"";
+    NSString *n = name ?: @"";
+    if ([b containsString:@"tencent.xin"]) return YES;
+    if ([b containsString:@"weixin"]) return YES;
+    if ([b containsString:@"wechat"]) return YES;
+    if ([n containsString:@"微信"]) return YES;
+    for (NSString *s in schemes) {
+        NSString *low = s.lowercaseString;
+        if ([low isEqualToString:@"weixin"] || [low hasPrefix:@"weixin"]) return YES;
+    }
+    return NO;
+}
 
 static NSArray<NSDictionary *> *WXScanWeChatApps(void) {
     NSMutableArray *out = [NSMutableArray array];
@@ -91,7 +107,6 @@ static NSArray<NSDictionary *> *WXScanWeChatApps(void) {
         }
     } @catch (NSException *e) {}
 
-    WXLOG(@"文件扫描得到 %lu 个 app 路径", (unsigned long)appPaths.count);
     for (NSString *p in appPaths) {
         NSDictionary *pl = [NSDictionary dictionaryWithContentsOfFile:[p stringByAppendingPathComponent:@"Info.plist"]];
         if (![pl isKindOfClass:[NSDictionary class]]) continue;
@@ -99,12 +114,12 @@ static NSArray<NSDictionary *> *WXScanWeChatApps(void) {
         if (![bid isKindOfClass:[NSString class]] || !bid.length) continue;
         NSString *name = pl[@"CFBundleDisplayName"] ?: pl[@"CFBundleName"];
         if (![name isKindOfClass:[NSString class]]) name = bid;
-        if (!WXIsWeChatApp(bid, name)) continue;
         NSArray *schemes = WXSchemesOfPlist(pl);
+        if (!WXLooksLikeWeChat(bid, name, schemes)) continue;
         [out addObject:@{@"bid": bid, @"name": name, @"schemes": schemes}];
     }
     if (out.count == 0) {
-        WXLOG(@"文件系统扫不到，改用 LaunchServices");
+        WXLOG(@"文件系统扫不到微信类应用，改用 LaunchServices");
         out = [WXScanViaLSWorkspace() mutableCopy];
     }
     return out;
@@ -123,7 +138,6 @@ static NSArray<NSDictionary *> *WXScanViaLSWorkspace(void) {
             @try { bid = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(bundleIdentifier)); } @catch (NSException *e) {}
             @try { name = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(localizedName)); } @catch (NSException *e) {}
             if (!bid.length) continue;
-            if (!WXIsWeChatApp(bid, name)) continue;
             NSArray *schemes = @[];
             @try {
                 id burl = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(bundleURL));
@@ -132,6 +146,7 @@ static NSArray<NSDictionary *> *WXScanViaLSWorkspace(void) {
                     if ([pl isKindOfClass:[NSDictionary class]]) schemes = WXSchemesOfPlist(pl);
                 }
             } @catch (NSException *e) {}
+            if (!WXLooksLikeWeChat(bid, name, schemes)) continue;
             [out addObject:@{@"bid": bid, @"name": name.length ? name : bid, @"schemes": schemes}];
         }
         WXLOG(@"LSW: 枚举到 %lu 个微信类应用", (unsigned long)out.count);
@@ -143,9 +158,13 @@ static NSArray<NSDictionary *> *WXScanViaLSWorkspace(void) {
 
 static NSArray<NSDictionary *> *WXCandidatesForURL(NSURL *url) {
     NSArray *all = WXScanWeChatApps();
-    NSMutableSet *others = [NSMutableSet set];
-    for (NSDictionary *a in all) for (NSString *s in a[@"schemes"]) [others addObject:s.lowercaseString];
-
+    NSMutableDictionary *counts = [NSMutableDictionary dictionary];
+    for (NSDictionary *b in all) {
+        for (NSString *s in b[@"schemes"]) {
+            NSString *low = s.lowercaseString;
+            counts[low] = @([counts[low] integerValue] + 1);
+        }
+    }
     NSMutableArray *res = [NSMutableArray array];
     for (NSDictionary *a in all) {
         NSString *bid = a[@"bid"];
@@ -154,20 +173,10 @@ static NSArray<NSDictionary *> *WXCandidatesForURL(NSURL *url) {
         NSString *fallback = nil;
         for (NSString *s in a[@"schemes"]) {
             NSString *low = s.lowercaseString;
-            if (!WXIsWeixinScheme(low)) continue;
-            if (![uniq length]) fallback = s;
-        }
-        // 找一个只属于该 App、且不是 weixin 系的 scheme
-        NSMutableDictionary *counts = [NSMutableDictionary dictionary];
-        for (NSDictionary *b in all) {
-            for (NSString *s in b[@"schemes"]) {
-                NSString *low = s.lowercaseString;
-                counts[low] = @([counts[low] integerValue] + 1);
-            }
+            if ([counts[low] integerValue] <= 1 && !WXIsWeixinScheme(low)) { uniq = s; break; }
         }
         for (NSString *s in a[@"schemes"]) {
-            NSString *low = s.lowercaseString;
-            if ([counts[low] integerValue] <= 1 && !WXIsWeixinScheme(low)) { uniq = s; break; }
+            if (WXIsWeixinScheme(s)) { fallback = s; break; }
         }
         NSMutableDictionary *m = [@{@"bid": bid, @"name": a[@"name"]} mutableCopy];
         if (uniq) m[@"scheme"] = uniq;
@@ -188,6 +197,14 @@ static UIViewController *WXTopViewController(void) {
     return vc;
 }
 
+static void WXOpenPassthrough(NSURL *url, NSDictionary *options, void (^done)(BOOL)) {
+    gWXBusy = YES;
+    [[UIApplication sharedApplication] openURL:url options:options ?: @{} completionHandler:^(BOOL ok) {
+        if (done) done(ok);
+    }];
+    gWXBusy = NO;
+}
+
 static BOOL WXOpenByScheme(NSURL *url, NSString *scheme, void (^done)(BOOL)) {
     if (!scheme.length) return NO;
     NSURLComponents *c = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
@@ -195,10 +212,10 @@ static BOOL WXOpenByScheme(NSURL *url, NSString *scheme, void (^done)(BOOL)) {
     NSURL *u = c.URL;
     if (!u) return NO;
     WXLOG(@"改写 scheme -> %@ : %@", scheme, u.absoluteString);
-    [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:^(BOOL ok) {
+    WXOpenPassthrough(u, @{}, ^(BOOL ok) {
         WXLOG(@"改写后打开结果=%d", ok);
         if (done) done(ok);
-    }];
+    });
     return YES;
 }
 
@@ -215,14 +232,17 @@ static BOOL WXOpenByBundleID(NSURL *url, NSString *bid, void (^done)(BOOL)) {
         if (![ws respondsToSelector:sel]) continue;
         @try {
             BOOL ok = NO;
+            gWXBusy = YES;
             if ([sn hasSuffix:@"allowUnlock:"]) {
                 ok = ((BOOL (*)(id, SEL, id, id, BOOL))objc_msgSend)(ws, sel, url, bid, YES);
             } else {
                 ok = ((BOOL (*)(id, SEL, id, id))objc_msgSend)(ws, sel, url, bid);
             }
+            gWXBusy = NO;
             WXLOG(@"私有接口 %@ -> %d", sn, ok);
             if (ok) { if (done) done(YES); return YES; }
         } @catch (NSException *e) {
+            gWXBusy = NO;
             WXLOG(@"私有接口异常 %@ %@", sn, e.reason);
         }
     }
@@ -247,12 +267,14 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
             if (!handled) handled = WXOpenByBundleID(url, cand[@"bid"], nil);
             if (!handled) {
                 WXLOG(@"两种方式都失败，回退系统默认，目标=%@", cand[@"bid"]);
-                [[UIApplication sharedApplication] openURL:url options:options ?: @{} completionHandler:completion];
+                WXOpenPassthrough(url, options, completion);
+            } else if (completion) {
+                completion(YES);
             }
         }]];
     }
     [ac addAction:[UIAlertAction actionWithTitle:@"系统默认" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        [[UIApplication sharedApplication] openURL:url options:options ?: @{} completionHandler:completion];
+        WXOpenPassthrough(url, options, completion);
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
         if (completion) completion(NO);
@@ -264,15 +286,24 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
     [top presentViewController:ac animated:YES completion:nil];
 }
 
-static BOOL WXIntercept(NSURL *url, NSDictionary *options, void (^completion)(BOOL)) {
+// 返回 YES 表示已经由本插件接管（调用方应直接返回成功）
+static BOOL WXTryIntercept(NSURL *url, NSDictionary *options, void (^completion)(BOOL), NSString *entry) {
+    if (gWXBusy) return NO;
     @try {
         if (!url) return NO;
-        if (url.scheme.length) WXLOG(@"openURL scheme=%@", url.scheme);
+        NSString *scheme = url.scheme ?: @"";
+        NSString *host = url.host ?: @"";
+        WXLOG(@"[%@] %@ //%@", entry, scheme.length ? scheme : @"(无)", host);
         if (WXIsSelfWeChat()) return NO;
-        if (!WXIsWeixinScheme(url.scheme)) return NO;
+        if (!WXIsWeixinScheme(scheme)) {
+            if ([scheme.lowercaseString isEqualToString:@"https"] && [WXWeChatLinkHosts() containsObject:host.lowercaseString]) {
+                WXLOG(@"  注意：这是微信相关 https 链接（可能走 Universal Link），暂不接管");
+            }
+            return NO;
+        }
         NSArray *cands = WXCandidatesForURL(url);
         WXLOG(@"拦截 %@ 候选 %lu 个", url.absoluteString, (unsigned long)cands.count);
-        for (NSDictionary *c in cands) WXLOG(@"  候选：%@ %@ scheme=%@", c[@"bid"], c[@"name"], c[@"scheme"] ?: @"(无)");
+        for (NSDictionary *c in cands) WXLOG(@"  候选：%@ %@ scheme=%@ wxScheme=%@", c[@"bid"], c[@"name"], c[@"scheme"] ?: @"(无)", c[@"wxScheme"] ?: @"(无)");
         if (cands.count < 2) return NO;
         dispatch_async(dispatch_get_main_queue(), ^{
             WXPresentChooser(url, cands, options, completion);
@@ -284,20 +315,117 @@ static BOOL WXIntercept(NSURL *url, NSDictionary *options, void (^completion)(BO
     }
 }
 
+#pragma mark - 运行时挂钩
+
+static BOOL (*o_app_openURL_opts)(id, SEL, NSURL *, NSDictionary *, void (^)(BOOL)) = NULL;
+static BOOL (*o_app_openURL)(id, SEL, NSURL *) = NULL;
+static BOOL (*o_app__openURL_opts)(id, SEL, NSURL *, id) = NULL;
+static BOOL (*o_lsw_openURL)(id, SEL, NSURL *) = NULL;
+static BOOL (*o_lsw_openURL_opts)(id, SEL, NSURL *, id) = NULL;
+static BOOL (*o_lsw_openSensitive)(id, SEL, NSURL *, id) = NULL;
+static BOOL (*o_ext_openURL)(id, SEL, NSURL *, void (^)(BOOL)) = NULL;
+
+static BOOL h_app_openURL_opts(id self, SEL _cmd, NSURL *url, NSDictionary *opts, void (^cb)(BOOL)) {
+    if (WXTryIntercept(url, opts, cb, @"UIApplication openURL:options:")) return YES;
+    if (!o_app_openURL_opts) return NO;
+    gWXBusy = YES;
+    BOOL r = o_app_openURL_opts(self, _cmd, url, opts, cb);
+    gWXBusy = NO;
+    return r;
+}
+
+static BOOL h_app_openURL(id self, SEL _cmd, NSURL *url) {
+    if (WXTryIntercept(url, @{}, nil, @"UIApplication openURL:")) return YES;
+    if (!o_app_openURL) return NO;
+    gWXBusy = YES;
+    BOOL r = o_app_openURL(self, _cmd, url);
+    gWXBusy = NO;
+    return r;
+}
+
+static BOOL h_app__openURL_opts(id self, SEL _cmd, NSURL *url, id opts) {
+    if (WXTryIntercept(url, [opts isKindOfClass:[NSDictionary class]] ? opts : @{}, nil, @"UIApplication _openURL:options:")) return YES;
+    if (!o_app__openURL_opts) return NO;
+    gWXBusy = YES;
+    BOOL r = o_app__openURL_opts(self, _cmd, url, opts);
+    gWXBusy = NO;
+    return r;
+}
+
+static BOOL h_lsw_openURL(id self, SEL _cmd, NSURL *url) {
+    if (WXTryIntercept(url, @{}, nil, @"LSWorkspace openURL:")) return YES;
+    if (!o_lsw_openURL) return NO;
+    gWXBusy = YES;
+    BOOL r = o_lsw_openURL(self, _cmd, url);
+    gWXBusy = NO;
+    return r;
+}
+
+static BOOL h_lsw_openURL_opts(id self, SEL _cmd, NSURL *url, id opts) {
+    if (WXTryIntercept(url, [opts isKindOfClass:[NSDictionary class]] ? opts : @{}, nil, @"LSWorkspace openURL:withOptions:")) return YES;
+    if (!o_lsw_openURL_opts) return NO;
+    gWXBusy = YES;
+    BOOL r = o_lsw_openURL_opts(self, _cmd, url, opts);
+    gWXBusy = NO;
+    return r;
+}
+
+static BOOL h_lsw_openSensitive(id self, SEL _cmd, NSURL *url, id opts) {
+    if (WXTryIntercept(url, [opts isKindOfClass:[NSDictionary class]] ? opts : @{}, nil, @"LSWorkspace openSensitiveURL:withOptions:")) return YES;
+    if (!o_lsw_openSensitive) return NO;
+    gWXBusy = YES;
+    BOOL r = o_lsw_openSensitive(self, _cmd, url, opts);
+    gWXBusy = NO;
+    return r;
+}
+
+static BOOL h_ext_openURL(id self, SEL _cmd, NSURL *url, void (^cb)(BOOL)) {
+    if (WXTryIntercept(url, @{}, cb, @"NSExtensionContext openURL:")) return YES;
+    if (!o_ext_openURL) return NO;
+    gWXBusy = YES;
+    BOOL r = o_ext_openURL(self, _cmd, url, cb);
+    gWXBusy = NO;
+    return r;
+}
+
+static void WXInstallHook(Class cls, NSString *selName, IMP newImp, IMP *outOrig, NSString *tag) {
+    if (!cls) { WXLOG(@"挂钩跳过：类不存在 %@", tag); return; }
+    SEL sel = NSSelectorFromString(selName);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) { WXLOG(@"挂钩跳过：方法不存在 %@", tag); return; }
+    IMP old = method_setImplementation(m, newImp);
+    if (outOrig) *outOrig = old;
+    WXLOG(@"挂钩成功：%@", tag);
+}
+
+static BOOL gWXLSHooked = NO;
+
+static void WXInstallHooks(void) {
+    static BOOL appDone = NO;
+    if (!appDone) {
+        appDone = YES;
+        Class app = NSClassFromString(@"UIApplication");
+        WXInstallHook(app, @"openURL:options:completionHandler:", (IMP)h_app_openURL_opts, (IMP *)&o_app_openURL_opts, @"UIApplication openURL:options:completionHandler:");
+        WXInstallHook(app, @"openURL:", (IMP)h_app_openURL, (IMP *)&o_app_openURL, @"UIApplication openURL:");
+        WXInstallHook(app, @"_openURL:options:", (IMP)h_app__openURL_opts, (IMP *)&o_app__openURL_opts, @"UIApplication _openURL:options:");
+        Class ext = NSClassFromString(@"NSExtensionContext");
+        WXInstallHook(ext, @"openURL:completionHandler:", (IMP)h_ext_openURL, (IMP *)&o_ext_openURL, @"NSExtensionContext openURL:completionHandler:");
+    }
+    if (!gWXLSHooked) {
+        Class lsw = NSClassFromString(@"LSApplicationWorkspace");
+        if (lsw) {
+            gWXLSHooked = YES;
+            WXInstallHook(lsw, @"openURL:", (IMP)h_lsw_openURL, (IMP *)&o_lsw_openURL, @"LSWorkspace openURL:");
+            WXInstallHook(lsw, @"openURL:withOptions:", (IMP)h_lsw_openURL_opts, (IMP *)&o_lsw_openURL_opts, @"LSWorkspace openURL:withOptions:");
+            WXInstallHook(lsw, @"openSensitiveURL:withOptions:", (IMP)h_lsw_openSensitive, (IMP *)&o_lsw_openSensitive, @"LSWorkspace openSensitiveURL:withOptions:");
+        }
+    }
+}
+
 __attribute__((constructor)) static void WXInit(void) {
     WXLOG(@"LOADED in %@ (%@)", WXSelfBundleID(), WXIsSelfWeChat() ? @"微信本体" : @"其他进程");
+    WXInstallHooks();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        WXInstallHooks();
+    });
 }
-
-%hook UIApplication
-
-- (void)openURL:(NSURL *)url options:(NSDictionary<NSString *, id> *)options completionHandler:(void (^)(BOOL))completionHandler {
-    if (WXIntercept(url, options, completionHandler)) return;
-    %orig;
-}
-
-- (BOOL)openURL:(NSURL *)url {
-    if (WXIntercept(url, @{}, nil)) return YES;
-    return %orig;
-}
-
-%end
