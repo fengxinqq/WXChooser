@@ -601,6 +601,7 @@ static UIWindow *gWXOverlay = nil;
 static volatile BOOL gWXOverlayVisible = NO;
 static NSString *const kWXGuard = @"/var/mobile/wxchooser.guard";
 static BOOL gWXGuardTripped = NO;
+static CFAbsoluteTime gWXSuppressUntil = 0;
 static void WXSetGuard(BOOL on) {
     @try {
         if (on) [@"1" writeToFile:kWXGuard atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -615,6 +616,7 @@ static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
         WXLoadSBS();
         if (!bid.length) return NO;
         gWXBusy = YES;
+        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 4.0;
         BOOL ok = NO;
         if (gSBSLaunchWithURL) {
             CFStringRef err = NULL;
@@ -707,16 +709,20 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                 [ac addAction:[UIAlertAction actionWithTitle:nm style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
                     WXLOG(@"用户选择：%@ (%@)", nm, bid);
                     WXSBHideOverlay();
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        WXSBLaunchByBundle(url, bid);
+                    NSURL *u2 = url;
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                        WXLOG(@"后台线程开始拉起 %@", bid);
+                        WXSBLaunchByBundle(u2, bid);
                     });
                 }]];
             }
             [ac addAction:[UIAlertAction actionWithTitle:@"系统默认微信" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
                 WXLOG(@"用户选择：系统默认");
                 WXSBHideOverlay();
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    WXSBLaunchByBundle(url, @"com.tencent.xin");
+                NSURL *u3 = url;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    WXLOG(@"后台线程开始拉起 com.tencent.xin");
+                    WXSBLaunchByBundle(u3, @"com.tencent.xin");
                 });
             }]];
             [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
@@ -902,7 +908,7 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
     BOOL intercept = NO;
     NSURL *hitURL = nil;
     @try {
-        if (!gWXBusy && !gWXOverlayVisible && !gWXGuardTripped) {
+        if (!gWXBusy && !gWXOverlayVisible && !gWXGuardTripped && CFAbsoluteTimeGetCurrent() > gWXSuppressUntil) {
             NSString *bid = WXBundleFromRequest(request);
             NSURL *u = WXLookupURL(request, 0);
             NSString *desc = nil;
