@@ -124,7 +124,15 @@ static NSArray<NSDictionary *> *WXScanViaLSWorkspace(void) {
             @try { name = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(localizedName)); } @catch (NSException *e) {}
             if (!bid.length) continue;
             if (!WXIsWeChatApp(bid, name)) continue;
-            [out addObject:@{@"bid": bid, @"name": name.length ? name : bid, @"schemes": @[]}];
+            NSArray *schemes = @[];
+            @try {
+                id burl = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(bundleURL));
+                if ([burl isKindOfClass:[NSURL class]]) {
+                    NSDictionary *pl = [NSDictionary dictionaryWithContentsOfURL:[(NSURL *)burl URLByAppendingPathComponent:@"Info.plist"]];
+                    if ([pl isKindOfClass:[NSDictionary class]]) schemes = WXSchemesOfPlist(pl);
+                }
+            } @catch (NSException *e) {}
+            [out addObject:@{@"bid": bid, @"name": name.length ? name : bid, @"schemes": schemes}];
         }
         WXLOG(@"LSW: 枚举到 %lu 个微信类应用", (unsigned long)out.count);
     } @catch (NSException *e) {
@@ -259,6 +267,7 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
 static BOOL WXIntercept(NSURL *url, NSDictionary *options, void (^completion)(BOOL)) {
     @try {
         if (!url) return NO;
+        if (url.scheme.length) WXLOG(@"openURL scheme=%@", url.scheme);
         if (WXIsSelfWeChat()) return NO;
         if (!WXIsWeixinScheme(url.scheme)) return NO;
         NSArray *cands = WXCandidatesForURL(url);
@@ -273,6 +282,10 @@ static BOOL WXIntercept(NSURL *url, NSDictionary *options, void (^completion)(BO
         WXLOG(@"拦截异常 %@", e.reason);
         return NO;
     }
+}
+
+__attribute__((constructor)) static void WXInit(void) {
+    WXLOG(@"LOADED in %@ (%@)", WXSelfBundleID(), WXIsSelfWeChat() ? @"微信本体" : @"其他进程");
 }
 
 %hook UIApplication
