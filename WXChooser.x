@@ -34,6 +34,9 @@ static void WXWriteLog(NSString *line) {
 static void (*o_sbmw_execute)(id, SEL, id, unsigned long long, id) = NULL;
 
 static volatile BOOL gWXBusy = NO;
+static volatile BOOL gWXDialoging = NO;
+static CFAbsoluteTime gWXCooldownUntil = 0;
+static NSString *gWXLastWXURL = nil;
 
 static NSString *WXSelfBundleID(void) {
     static NSString *bid = nil;
@@ -823,6 +826,8 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                 NSString *nm = cand[@"name"] ?: bid;
                 [ac addAction:[UIAlertAction actionWithTitle:nm style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
                     WXLOG(@"用户选择：%@ (%@)", nm, bid);
+                    gWXDialoging = NO;
+                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 25.0;
                     WXSBHideOverlay();
                     NSURL *u2 = url;
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -833,6 +838,8 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
             }
             [ac addAction:[UIAlertAction actionWithTitle:@"系统默认微信" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
                 WXLOG(@"用户选择：系统默认");
+                gWXDialoging = NO;
+                gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 25.0;
                 WXSBHideOverlay();
                 NSURL *u3 = url;
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -842,6 +849,8 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
             }]];
             [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
                 WXLOG(@"用户取消");
+                gWXDialoging = NO;
+                gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 25.0;
                 WXSBHideOverlay();
             }]];
             [top presentViewController:ac animated:NO completion:^{
@@ -850,6 +859,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
             }];
         } @catch (NSException *e) {
             WXLOG(@"SB 弹框异常 %@", e.reason);
+            gWXDialoging = NO;
             if (fallback) fallback();
         }
     });
@@ -957,12 +967,12 @@ static NSString *WXBundleFromRequest(id req) {
 }
 
 static NSString *WXScanForWeixinString(id obj, int depth, int *budget) {
-    if (!obj || depth > 3 || *budget <= 0) return nil;
+    if (!obj || depth > 6 || *budget <= 0) return nil;
     (*budget)--;
     @try {
         if ([obj isKindOfClass:[NSString class]]) {
             NSString *s = (NSString *)obj;
-            if (s.length > 5 && s.length < 500 && [s rangeOfString:@"weixin" options:NSCaseInsensitiveSearch].location != NSNotFound) return s;
+            if (s.length > 5 && s.length < 900 && [s rangeOfString:@"weixin://" options:NSCaseInsensitiveSearch].location != NSNotFound) return s;
             return nil;
         }
         if ([obj isKindOfClass:[NSURL class]]) {
@@ -1062,6 +1072,7 @@ static NSString *WXWeixinURLFromString(NSString *s) {
 
 static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long options, id validator) {
     BOOL intercept = NO;
+    BOOL shouldShow = NO;
     NSURL *hitURL = nil;
     @try {
         if (!gWXBusy && !gWXOverlayVisible && !gWXGuardTripped && CFAbsoluteTimeGetCurrent() > gWXSuppressUntil) {
@@ -1092,7 +1103,7 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
             if (looksWX && (urlLike || bidKnown)) {
                 if (!desc) { @try { desc = [request description]; } @catch (NSException *e) {} }
                 if (!u) {
-                    int budget = 400;
+                    int budget = 1500;
                     NSString *raw = WXScanForWeixinString(request, 0, &budget);
                     if (!raw) raw = WXWeixinURLFromString(desc);
                     if (raw) {
@@ -1101,11 +1112,25 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
                         else WXLOG(@"  取到的不是有效微信 URL：%@", raw);
                     }
                 }
+                if (u) gWXLastWXURL = u.absoluteString;
                 static CFAbsoluteTime lastHit = 0;
                 CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
                 BOOL tooSoon = (now - lastHit < 1.2);
-                if (!tooSoon && WXSBEnsureOverlay()) {
+                BOOL busyByDialog = (gWXDialoging || now < gWXCooldownUntil);
+                if (busyByDialog) {
+                    WXLOG(@"弹框进行中/刚选完，静默拒绝重复请求 url=%@", u.absoluteString ?: @"(无)");
+                    if ([request respondsToSelector:NSSelectorFromString(@"declineWithReason:")]) {
+                        @try {
+                            ((void (*)(id, SEL, id))objc_msgSend)(request, NSSelectorFromString(@"declineWithReason:"), @"WXChooser 静默接管");
+                            WXLOG(@"  已静默拒绝重复事务");
+                        } @catch (NSException *e) {}
+                    }
+                    intercept = YES;
+                    hitURL = u;
+                } else if (!tooSoon && WXSBEnsureOverlay()) {
                     lastHit = now;
+                    gWXDialoging = YES;
+                    shouldShow = YES;
                     WXLOG(@"★ SB 拦到拉起微信：bid=%@ url=%@", bid ?: @"(未知)", u.absoluteString ?: @"(无)");
                     gWXPendingReq = request;
                     gWXPendingSelf = self;
@@ -1131,7 +1156,12 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
         WXLOG(@"SBMainWorkspace 拦截异常 %@", e.reason);
     }
     if (intercept) {
-        WXSBShowChooser(hitURL, @"SBMainWorkspace", nil);
+        if (!hitURL && gWXLastWXURL.length) {
+            NSURL *memo = [NSURL URLWithString:gWXLastWXURL];
+            if (memo && WXIsTargetURL(memo)) { hitURL = memo; WXLOG(@"  用记忆的票据 URL：%@", memo.absoluteString); }
+        }
+        if (shouldShow) WXSBShowChooser(hitURL, @"SBMainWorkspace", nil);
+        else WXLOG(@"静默拦截已完成，不重复弹框");
         return;
     }
     if (o_sbmw_execute) {
