@@ -927,6 +927,48 @@ static NSString *WXScanForWeixinString(id obj, int depth, int *budget) {
     }
 }
 
+static NSString *WXScanForBundleString(id obj, int depth, int *budget) {
+    if (!obj || depth > 3 || *budget <= 0) return nil;
+    (*budget)--;
+    @try {
+        if ([obj isKindOfClass:[NSString class]]) {
+            NSString *s = (NSString *)obj;
+            if ([s hasPrefix:@"com.tencent.xin"]) return s;
+            return nil;
+        }
+        if ([obj isKindOfClass:[NSArray class]]) {
+            for (id x in (NSArray *)obj) { NSString *r = WXScanForBundleString(x, depth + 1, budget); if (r) return r; }
+            return nil;
+        }
+        if ([obj isKindOfClass:[NSSet class]]) {
+            for (id x in (NSSet *)obj) { NSString *r = WXScanForBundleString(x, depth + 1, budget); if (r) return r; }
+            return nil;
+        }
+        if ([obj isKindOfClass:[NSDictionary class]]) {
+            for (id k in (NSDictionary *)obj) { NSString *r = WXScanForBundleString([(NSDictionary *)obj objectForKey:k], depth + 1, budget); if (r) return r; }
+            return nil;
+        }
+        Class cls = object_getClass(obj);
+        if (!cls) return nil;
+        unsigned int n = 0;
+        Ivar *ivars = class_copyIvarList(cls, &n);
+        if (!ivars) return nil;
+        NSString *found = nil;
+        for (unsigned int i = 0; i < n && !found; i++) {
+            const char *t = ivar_getTypeEncoding(ivars[i]);
+            if (!t || t[0] != '@') continue;
+            @try {
+                id v = object_getIvar(obj, ivars[i]);
+                if (v) found = WXScanForBundleString(v, depth + 1, budget);
+            } @catch (NSException *e) {}
+        }
+        free(ivars);
+        return found;
+    } @catch (NSException *e) {
+        return nil;
+    }
+}
+
 static NSString *WXWeixinURLFromString(NSString *s) {
     if (!s.length) return nil;
     NSRange r = [s rangeOfString:@"weixin" options:NSCaseInsensitiveSearch];
@@ -949,8 +991,14 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
         if (!gWXBusy && !gWXOverlayVisible && !gWXGuardTripped && CFAbsoluteTimeGetCurrent() > gWXSuppressUntil) {
             NSString *bid = WXBundleFromRequest(request);
             NSURL *u = WXLookupURL(request, 0);
+            BOOL bidKnown = [bid hasPrefix:@"com.tencent.xin"];
+            if (!bidKnown) {
+                int b2 = 400;
+                NSString *sb2 = WXScanForBundleString(request, 0, &b2);
+                if (sb2) { bid = sb2; bidKnown = YES; WXLOG(@"  深度扫描到目标包：%@", sb2); }
+            }
             NSString *desc = nil;
-            BOOL looksWX = [bid hasPrefix:@"com.tencent.xin"];
+            BOOL looksWX = bidKnown;
             if (!looksWX) {
                 @try { desc = [request description]; } @catch (NSException *e) {}
                 looksWX = [desc containsString:@"com.tencent.xin"];
@@ -958,7 +1006,7 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
             BOOL urlLike = (u && WXIsTargetURL(u))
                         || (desc && [desc.lowercaseString containsString:@"weixin"])
                         || (u && WXIsWeChatWebURL(u));
-            if (looksWX && urlLike) {
+            if (looksWX && (urlLike || bidKnown)) {
                 if (!desc) { @try { desc = [request description]; } @catch (NSException *e) {} }
                 if (!u) {
                     int budget = 400;
