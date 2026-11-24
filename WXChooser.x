@@ -263,10 +263,14 @@ static UIViewController *WXTopViewController(void) {
 
 static void WXOpenPassthrough(NSURL *url, NSDictionary *options, void (^done)(BOOL)) {
     gWXBusy = YES;
-    [[UIApplication sharedApplication] openURL:url options:options ?: @{} completionHandler:^(BOOL ok) {
-        if (done) done(ok);
-    }];
-    gWXBusy = NO;
+    void (^fire)(void) = ^{
+        [[UIApplication sharedApplication] openURL:url options:options ?: @{} completionHandler:^(BOOL ok) {
+            WXLOG(@"原样放行结果=%d url=%@", ok, url.absoluteString);
+            gWXBusy = NO;
+            if (done) done(ok);
+        }];
+    };
+    if ([NSThread isMainThread]) fire(); else dispatch_async(dispatch_get_main_queue(), fire);
 }
 
 static BOOL WXOpenByScheme(NSURL *url, NSString *scheme, void (^done)(BOOL)) {
@@ -417,7 +421,9 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
         [ac addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
             BOOL handled = NO;
             NSString *scheme = cand[@"scheme"];
-            if (scheme.length) handled = WXOpenByScheme(url, scheme, ^(BOOL ok) {
+            NSString *bid = cand[@"bid"];
+            if (bid.length) handled = WXOpenByBundleID(url, bid, nil);
+            if (!handled && scheme.length) handled = WXOpenByScheme(url, scheme, ^(BOOL ok) {
                 if (!ok) WXLOG(@"scheme 方式打开失败：%@", scheme);
             });
             if (!handled) handled = WXRequestSpringBoardLaunch(url, cand[@"bid"]);
@@ -448,7 +454,7 @@ static BOOL WXTryIntercept(NSURL *url, NSDictionary *options, void (^completion)
     if (gWXBusy) return NO;
     NSString *selfBid = WXSelfBundleID();
     BOOL inSpringBoard = [selfBid isEqualToString:@"com.apple.springboard"];
-    WXLOG(@"[%@] 入口调用 App=%@ url=%@", entry, selfBid ?: @"(未知)", url.absoluteString ?: @"(无)");
+    WXLOG(@"[%@] 入口调用 App=%@ url=%@ opts=%@", entry, selfBid ?: @"(未知)", url.absoluteString ?: @"(无)", options ? [(NSDictionary *)options description] : @"(空)");
     if (inSpringBoard) return NO;   // SpringBoard 走 SBMainWorkspace 那一层
     @try {
         if (!url) return NO;
