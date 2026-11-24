@@ -643,15 +643,37 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
 
             if (!gWXOverlay) {
                 UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-                w.windowLevel = UIWindowLevelAlert + 10;
+                // iOS 13+ 必须挂到一个真实的 UIWindowScene，否则窗口永远不显示
+                @try {
+                    UIWindowScene *sc = nil;
+                    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+                        if ([s isKindOfClass:[UIWindowScene class]] && s.activationState == UISceneActivationStateForegroundActive) { sc = (UIWindowScene *)s; break; }
+                    }
+                    if (!sc) {
+                        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+                            if ([s isKindOfClass:[UIWindowScene class]]) { sc = (UIWindowScene *)s; break; }
+                        }
+                    }
+                    if (!sc) {
+                        for (UIWindow *win in [UIApplication sharedApplication].windows) {
+                            if (win.windowScene) { sc = win.windowScene; break; }
+                        }
+                    }
+                    if (sc) { w.windowScene = sc; WXLOG(@"SB 窗口已挂 scene：%@", NSStringFromClass([sc class])); }
+                    else WXLOG(@"SB 窗口未找到 scene");
+                } @catch (NSException *e) { WXLOG(@"挂 scene 异常 %@", e.reason); }
+                w.windowLevel = UIWindowLevelAlert + 100;
                 w.backgroundColor = [UIColor clearColor];
-                UIViewController *vc = [[UIViewController alloc] init];
-                vc.view.backgroundColor = [UIColor clearColor];
-                w.rootViewController = vc;
+                w.rootViewController = [[UIViewController alloc] init];
+                w.rootViewController.view.backgroundColor = [UIColor clearColor];
                 gWXOverlay = w;
+                WXLOG(@"SB 悬浮窗口已创建 level=%.0f bounds=%@", w.windowLevel, NSStringFromCGRect(w.bounds));
             }
             gWXOverlay.hidden = NO;
+            @try { [gWXOverlay makeKeyAndVisible]; } @catch (NSException *e) {}
             gWXOverlayVisible = YES;
+            WXLOG(@"SB 窗口状态：hidden=%d key=%d alpha=%.2f scene=%@", gWXOverlay.isHidden, gWXOverlay.isKeyWindow,
+                  gWXOverlay.alpha, gWXOverlay.windowScene ? @"有" : @"无");
             UIViewController *top = gWXOverlay.rootViewController;
             while (top.presentedViewController) top = top.presentedViewController;
 
@@ -787,6 +809,53 @@ static NSString *WXBundleFromRequest(id req) {
     return nil;
 }
 
+static NSString *WXScanForWeixinString(id obj, int depth, int *budget) {
+    if (!obj || depth > 3 || *budget <= 0) return nil;
+    (*budget)--;
+    @try {
+        if ([obj isKindOfClass:[NSString class]]) {
+            NSString *s = (NSString *)obj;
+            if (s.length > 5 && s.length < 500 && [s rangeOfString:@"weixin" options:NSCaseInsensitiveSearch].location != NSNotFound) return s;
+            return nil;
+        }
+        if ([obj isKindOfClass:[NSURL class]]) {
+            NSString *s = [(NSURL *)obj absoluteString];
+            if ([s rangeOfString:@"weixin" options:NSCaseInsensitiveSearch].location != NSNotFound) return s;
+            return nil;
+        }
+        if ([obj isKindOfClass:[NSArray class]]) {
+            for (id x in (NSArray *)obj) { NSString *r = WXScanForWeixinString(x, depth + 1, budget); if (r) return r; }
+            return nil;
+        }
+        if ([obj isKindOfClass:[NSSet class]]) {
+            for (id x in (NSSet *)obj) { NSString *r = WXScanForWeixinString(x, depth + 1, budget); if (r) return r; }
+            return nil;
+        }
+        if ([obj isKindOfClass:[NSDictionary class]]) {
+            for (id k in (NSDictionary *)obj) { NSString *r = WXScanForWeixinString([(NSDictionary *)obj objectForKey:k], depth + 1, budget); if (r) return r; }
+            return nil;
+        }
+        Class cls = object_getClass(obj);
+        if (!cls) return nil;
+        unsigned int n = 0;
+        Ivar *ivars = class_copyIvarList(cls, &n);
+        if (!ivars) return nil;
+        NSString *found = nil;
+        for (unsigned int i = 0; i < n && !found; i++) {
+            const char *t = ivar_getTypeEncoding(ivars[i]);
+            if (!t || t[0] != '@') continue;
+            @try {
+                id v = object_getIvar(obj, ivars[i]);
+                if (v) found = WXScanForWeixinString(v, depth + 1, budget);
+            } @catch (NSException *e) {}
+        }
+        free(ivars);
+        return found;
+    } @catch (NSException *e) {
+        return nil;
+    }
+}
+
 static NSString *WXWeixinURLFromString(NSString *s) {
     if (!s.length) return nil;
     NSRange r = [s rangeOfString:@"weixin" options:NSCaseInsensitiveSearch];
@@ -818,11 +887,44 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
                         || (desc && [desc.lowercaseString containsString:@"weixin"])
                         || (u && WXIsWeChatWebURL(u));
             if (looksWX && urlLike && !WXIsSelfWeChat() && !gWXOverlayVisible) {
+                if (!desc) { @try { desc = [request description]; } @catch (NSException *e) {} }
                 if (!u) {
-                    NSString *raw = WXWeixinURLFromString(desc);
-                    if (raw) u = [NSURL URLWithString:raw];
+                    int budget = 500;
+                    NSString *raw = WXScanForWeixinString(request, 0, &budget);
+                    if (!raw) raw = WXWeixinURLFromString(desc);
+                    if (raw) {
+                        NSURL *cand = [NSURL URLWithString:raw];
+                        if (cand && WXIsTargetURL(cand)) { u = cand; WXLOG(@"  深度反射拿到 URL：%@", raw); }
+                        else WXLOG(@"  反射到的字符串不是有效微信 URL：%@", raw);
+                    }
                 }
                 WXLOG(@"★ SB 拦到拉起微信：bid=%@ url=%@ options=%llu", bid ?: @"(未知)", u.absoluteString ?: @"(无)", options);
+                WXLOG(@"  [请求类] %@", NSStringFromClass([request class]));
+                for (NSString *k in @[@"applicationSceneEntities", @"entities", @"context", @"finalDestination",
+                                     @"applicationSceneEntity", @"targetApplication", @"requestedURL", @"URL", @"url",
+                                     @"sceneSettings", @"actions", @"application"]) {
+                    SEL ks = NSSelectorFromString(k);
+                    if (![request respondsToSelector:ks]) continue;
+                    @try {
+                        id v = ((id (*)(id, SEL))objc_msgSend)(request, ks);
+                        WXLOG(@"    %@ => %@", k, v ? NSStringFromClass([v class]) : @"nil");
+                        if ([v isKindOfClass:[NSArray class]]) {
+                            for (id e in (NSArray *)v) {
+                                WXLOG(@"      [元素] %@", NSStringFromClass([e class]));
+                                for (NSString *k2 in @[@"application", @"scene", @"actions", @"sceneSettings", @"applicationSceneSettings", @"workspaceEntity"]) {
+                                    SEL s2 = NSSelectorFromString(k2);
+                                    if (![e respondsToSelector:s2]) continue;
+                                    @try {
+                                        id v2 = ((id (*)(id, SEL))objc_msgSend)(e, s2);
+                                        WXLOG(@"        %@ => %@", k2, v2 ? NSStringFromClass([v2 class]) : @"nil");
+                                    } @catch (NSException *e2) {}
+                                }
+                            }
+                        }
+                    } @catch (NSException *e3) {}
+                }
+                NSString *ds = desc ?: @"";
+                WXLOG(@"  [描述] %@", ds.length > 1100 ? [ds substringToIndex:1100] : ds);
                 if ([request respondsToSelector:NSSelectorFromString(@"declineWithReason:")]) {
                     ((void (*)(id, SEL, id))objc_msgSend)(request, NSSelectorFromString(@"declineWithReason:"), @"WXChooser 接管");
                     WXLOG(@"  已拒绝原启动事务，改由本插件拉起");
