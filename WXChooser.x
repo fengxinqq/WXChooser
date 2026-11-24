@@ -545,6 +545,137 @@ static void WXInstallHooks(void) {
     }
 }
 
+#pragma mark - SpringBoard 层的 URL 路由拦截
+
+static UIWindow *gWXOverlay = nil;
+static BOOL (*o_router_openURL)(id, SEL, NSURL *) = NULL;
+static BOOL (*o_router_openSensitive)(id, SEL, NSURL *) = NULL;
+
+static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
+    WXLoadSBS();
+    if (!gSBSLaunchWithURL || !bid.length) return NO;
+    CFStringRef err = NULL;
+    int r = gSBSLaunchWithURL((__bridge CFStringRef)bid, (__bridge CFURLRef)url,
+                              (__bridge CFDictionaryRef)@{}, &err, false);
+    WXLOG(@"SB 启动 %@ r=%d err=%@", bid, r, err ? (__bridge NSString *)err : @"无");
+    if (err) CFRelease(err);
+    return (r == 0);
+}
+
+static void WXSBHideOverlay(void) {
+    @try {
+        UIViewController *vc = gWXOverlay.rootViewController;
+        if (vc.presentedViewController) [vc dismissViewControllerAnimated:NO completion:nil];
+        gWXOverlay.hidden = YES;
+    } @catch (NSException *e) {}
+}
+
+static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void)) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            NSArray *cands = WXCandidatesForURL(url);
+            WXLOG(@"SB 拦截（%@）%@ 候选 %lu 个", entry, url.absoluteString, (unsigned long)cands.count);
+            for (NSDictionary *c in cands) WXLOG(@"  SB候选：%@ %@", c[@"bid"], c[@"name"]);
+
+            if (!gWXOverlay) {
+                UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+                w.windowLevel = UIWindowLevelAlert + 10;
+                w.backgroundColor = [UIColor clearColor];
+                UIViewController *vc = [[UIViewController alloc] init];
+                vc.view.backgroundColor = [UIColor clearColor];
+                w.rootViewController = vc;
+                gWXOverlay = w;
+            }
+            gWXOverlay.hidden = NO;
+            UIViewController *top = gWXOverlay.rootViewController;
+            while (top.presentedViewController) top = top.presentedViewController;
+
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"打开微信"
+                                                                       message:@"选择要跳转的微信"
+                                                                preferredStyle:UIAlertControllerStyleActionSheet];
+            for (NSDictionary *cand in cands) {
+                [ac addAction:[UIAlertAction actionWithTitle:(cand[@"name"] ?: cand[@"bid"])
+                                                       style:UIAlertActionStyleDefault
+                                                     handler:^(UIAlertAction *a) {
+                    WXSBLaunchByBundle(url, cand[@"bid"]);
+                    WXSBHideOverlay();
+                }]];
+            }
+            [ac addAction:[UIAlertAction actionWithTitle:@"系统默认" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                if (fallback) fallback();
+                WXSBHideOverlay();
+            }]];
+            [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
+                WXLOG(@"SB: 用户取消");
+                WXSBHideOverlay();
+            }]];
+            if (ac.popoverPresentationController) {
+                ac.popoverPresentationController.sourceView = top.view;
+                ac.popoverPresentationController.sourceRect = CGRectMake(top.view.bounds.size.width / 2.0, top.view.bounds.size.height, 1, 1);
+            }
+            [top presentViewController:ac animated:YES completion:nil];
+        } @catch (NSException *e) {
+            WXLOG(@"SB 弹框异常 %@", e.reason);
+        }
+    });
+}
+
+static BOOL h_router_openURL(id self, SEL _cmd, NSURL *url) {
+    @try {
+        WXLOG(@"[HFOpenURLRouter openURL:] %@", url.absoluteString);
+        if (!gWXBusy && url && WXIsWeixinScheme(url.scheme) && !WXIsSelfWeChat()) {
+            NSURL *u = url;
+            WXSBShowChooser(u, @"openURL:", ^{
+                if (o_router_openURL) o_router_openURL(self, _cmd, u);
+            });
+            return YES;
+        }
+    } @catch (NSException *e) {
+        WXLOG(@"openURL 拦截异常 %@", e.reason);
+    }
+    return o_router_openURL ? o_router_openURL(self, _cmd, url) : NO;
+}
+
+static BOOL h_router_openSensitive(id self, SEL _cmd, NSURL *url) {
+    @try {
+        WXLOG(@"[HFOpenURLRouter openSensitiveURL:] %@", url.absoluteString);
+        if (!gWXBusy && url && WXIsWeixinScheme(url.scheme) && !WXIsSelfWeChat()) {
+            NSURL *u = url;
+            WXSBShowChooser(u, @"openSensitiveURL:", ^{
+                if (o_router_openSensitive) o_router_openSensitive(self, _cmd, u);
+            });
+            return YES;
+        }
+    } @catch (NSException *e) {
+        WXLOG(@"openSensitive 拦截异常 %@", e.reason);
+    }
+    return o_router_openSensitive ? o_router_openSensitive(self, _cmd, url) : NO;
+}
+
+static void WXInstallRouterHooks(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    Class router = NSClassFromString(@"HFOpenURLRouter");
+    if (!router) { WXLOG(@"HFOpenURLRouter 不存在"); return; }
+    SEL s1 = NSSelectorFromString(@"openURL:");
+    Method m1 = class_getInstanceMethod(router, s1);
+    if (m1 && method_getNumberOfArguments(m1) == 3) {
+        o_router_openURL = (BOOL (*)(id, SEL, NSURL *))method_setImplementation(m1, (IMP)h_router_openURL);
+        WXLOG(@"挂钩成功：HFOpenURLRouter openURL:");
+    } else {
+        WXLOG(@"挂钩跳过：HFOpenURLRouter openURL: 参数数不符");
+    }
+    SEL s2 = NSSelectorFromString(@"openSensitiveURL:");
+    Method m2 = class_getInstanceMethod(router, s2);
+    if (m2 && method_getNumberOfArguments(m2) == 3) {
+        o_router_openSensitive = (BOOL (*)(id, SEL, NSURL *))method_setImplementation(m2, (IMP)h_router_openSensitive);
+        WXLOG(@"挂钩成功：HFOpenURLRouter openSensitiveURL:");
+    } else {
+        WXLOG(@"挂钩跳过：HFOpenURLRouter openSensitiveURL: 参数数不符");
+    }
+}
+
 __attribute__((constructor)) static void WXInit(void) {
     WXLOG(@"LOADED in %@ (%@)", WXSelfBundleID(), WXIsSelfWeChat() ? @"微信本体" : @"其他进程");
     WXInstallHooks();
@@ -555,7 +686,7 @@ __attribute__((constructor)) static void WXInit(void) {
         WXLoadSBS();
         WXLOG(@"SB: 已注册代办启动监听");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            WXDumpLaunchAPIs();
+            WXInstallRouterHooks();
         });
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
