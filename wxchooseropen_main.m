@@ -111,40 +111,42 @@ int main(int argc, char **argv) {
         id ws = WSObj();
         LG(@"工作区=%@ FBS=%@", ws ? NSStringFromClass([ws class]) : @"(空)", FBSvc() ? @"有" : @"无");
 
-        // 1) FrontBoard 系统服务按包名拉起
-        r = runWithTimeout(@"FBS", 6.0, ^{ return openViaFBSSystem(bid, nil); });
-        if (r == 0) how = @"FBS 系统服务";
+        BOOL useURLFirst = (url != nil);
 
-        // 2) LSApplicationWorkspace 同步按包名
+        if (useURLFirst) {
+            // 带 URL 的三条路先走：让微信直接进支付页
+            r = runWithTimeout(@"FBS+URL", 6.0, ^{ return openViaFBSSystem(bid, url); });
+            if (r == 0) how = @"FBS+URL";
+            if (r != 0) {
+                r = runWithTimeout(@"openSensitiveURL:withOptions:", 5.0, ^{
+                    SEL s = sel_getUid("openSensitiveURL:withOptions:");
+                    if (![ws respondsToSelector:s]) return NO;
+                    BOOL ok = ((BOOL (*)(id, SEL, id, id))objc_msgSend)(ws, s, url, nil);
+                    LG(@"openSensitiveURL:withOptions: 返回 %d", ok);
+                    return ok;
+                });
+                if (r == 0) how = @"openSensitiveURL";
+            }
+            if (r != 0) {
+                r = runWithTimeout(@"openURL:", 4.0, ^{ return callBOOL(ws, @"openURL:", url, nil); });
+                if (r == 0) how = @"openURL";
+            }
+            if (r != 0) {
+                r = runWithTimeout(@"openURL:withOptions:", 4.0, ^{ return callBOOL(ws, @"openURL:withOptions:", url, nil); });
+                if (r == 0) how = @"openURL:withOptions";
+            }
+        }
+
         if (r != 0) {
-            r = runWithTimeout(@"openApplicationWithBundleID:", 4.0, ^{
+            r = runWithTimeout(@"FBS", 6.0, ^{ return openViaFBSSystem(bid, nil); });
+            if (r == 0) how = @"FBS 系统服务";
+        }
+
+        if (r != 0) {
+            r = runWithTimeout(@"openApplicationWithBundleID:", 5.0, ^{
                 return callBOOL(ws, @"openApplicationWithBundleID:", bid, nil);
             });
             if (r == 0) how = @"按包名";
-        }
-
-        // 3) LSApplicationWorkspace 带 URL 打开（敏感 URL 优先）
-        if (r != 0 && url) {
-            r = runWithTimeout(@"openSensitiveURL:withOptions:", 4.0, ^{
-                SEL s = sel_getUid("openSensitiveURL:withOptions:");
-                if (![ws respondsToSelector:s]) return NO;
-                BOOL ok = ((BOOL (*)(id, SEL, id, id))objc_msgSend)(ws, s, url, nil);
-                LG(@"openSensitiveURL:withOptions: 返回 %d", ok);
-                return ok;
-            });
-            if (r == 0) how = @"openSensitiveURL";
-        }
-        if (r != 0 && url) {
-            r = runWithTimeout(@"openURL:", 3.0, ^{
-                return callBOOL(ws, @"openURL:", url, nil);
-            });
-            if (r == 0) how = @"openURL";
-        }
-
-        // 4) 带 URL 的 FBS 系统服务
-        if (r != 0 && url) {
-            r = runWithTimeout(@"FBS+URL", 6.0, ^{ return openViaFBSSystem(bid, url); });
-            if (r == 0) how = @"FBS+URL";
         }
 
         LG(@"最终 how=%@ r=%ld", how, (long)r);

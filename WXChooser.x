@@ -689,25 +689,7 @@ static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
         gWXBusy = YES;
         gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 14.0;
 
-        if ([bid isEqualToString:@"com.tencent.xin"] && gWXPendingReq) {
-            BOOL ok = WXReplayPending();
-            WXLOG(@"重放结果 %d", ok);
-            if (ok) {
-                if (url) {
-                    WXLOG(@"重放成功，1 秒后由启动器补送票据 %@", url.absoluteString);
-                    NSString *bidCopy = [bid copy];
-                    NSURL *urlCopy = [url copy];
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                            WXSBLaunchByBundle(urlCopy, bidCopy);
-                        });
-                    });
-                }
-                gWXBusy = NO;
-                return YES;
-            }
-        }
-
+        WXLOG(@"外部启动器接管 bid=%@ url=%@", bid, url.absoluteString ?: @"(无)");
 
         NSMutableArray *paths = [NSMutableArray array];
         NSString *selfPath = WXOpenerPath();
