@@ -4,6 +4,9 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <spawn.h>
+#import <fcntl.h>
+#import <sys/wait.h>
+#import <stdio.h>
 #import <sys/stat.h>
 #import <unistd.h>
 
@@ -620,30 +623,43 @@ static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
         if (!bid.length) return NO;
         gWXBusy = YES;
         gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 6.0;
-        NSString *cmdPath = @"/var/mobile/wxchooser_cmd.plist";
-        NSDictionary *cmd = @{ @"bid" : bid, @"url" : (url.absoluteString ?: @"") };
-        BOOL wrote = [cmd writeToFile:cmdPath atomically:YES];
-        WXLOG(@"写出启动命令 bid=%@ url=%@ ok=%d", bid, url.absoluteString ?: @"(无)", wrote);
-        if (!wrote) { gWXBusy = NO; return NO; }
+        WXLoadSBS();
+        if (!gSBSLaunchWithURL && !gSBSLaunch) { WXLOG(@"启动接口都不可用"); gWXBusy = NO; return NO; }
 
-        NSString *bin = @"/var/mobile/wxchooser/wxchooseropen";
-        if (![[NSFileManager defaultManager] isExecutableFileAtPath:bin]) {
-            WXLOG(@"启动器不存在：%@", bin);
-            gWXBusy = NO;
-            return NO;
+        // 所有可能分配内存的动作都在 fork 之前完成，子进程里只做一次纯调用
+        CFStringRef cbid = (__bridge CFStringRef)bid;
+        CFURLRef curl = url ? (__bridge CFURLRef)url : NULL;
+        CFDictionaryRef copts = CFDictionaryCreate(NULL, NULL, NULL, 0,
+                                                   &kCFTypeDictionaryKeyCallBacks,
+                                                   &kCFTypeDictionaryValueCallBacks);
+        int fd = open("/var/mobile/wxchooser.log", O_WRONLY | O_APPEND);
+        pid_t pid = fork();
+        if (pid == 0) {
+            int r = -1;
+            if (gSBSLaunchWithURL) {
+                r = gSBSLaunchWithURL(cbid, curl, copts, NULL, false);
+            } else if (gSBSLaunch) {
+                r = gSBSLaunch(cbid, false);
+            }
+            if (fd >= 0) {
+                char buf[256];
+                int n = snprintf(buf, sizeof(buf), "[子进程 %d] 拉起 %s r=%d\n", (int)getpid(), bid.UTF8String, r);
+                if (n > 0) write(fd, buf, (size_t)n);
+                close(fd);
+            }
+            _exit(0);
         }
-        // 确保目录可执行（越狱目录有时是 700）
-        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions:@(0755)} ofItemAtPath:@"/var/mobile/wxchooser" error:nil];
-        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions:@(0755)} ofItemAtPath:bin error:nil];
+        WXLOG(@"fork 结果 pid=%d（0 表示失败）", (int)pid);
+        if (fd >= 0) close(fd);
+        if (pid < 0) { gWXBusy = NO; return NO; }
 
-        const char *path = bin.UTF8String;
-        char *const argsv[] = { (char *)path, NULL };
-        char *const envv[] = { (char *)"PATH=/usr/bin:/bin:/usr/sbin:/sbin", (char *)"HOME=/var/mobile", NULL };
-        pid_t pid = 0;
-        int rc = posix_spawn(&pid, path, NULL, NULL, argsv, envv);
-        WXLOG(@"拉起启动器 pid=%d rc=%d", (int)pid, rc);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            int st = 0;
+            waitpid(pid, &st, WNOHANG);
+        });
         gWXBusy = NO;
-        return (rc == 0);
+        return YES;
     } @catch (NSException *e) {
         gWXBusy = NO;
         WXLOG(@"拉起动作异常 %@", e.reason);
