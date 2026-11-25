@@ -893,17 +893,6 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                     });
                 }]];
             }
-            [ac addAction:[UIAlertAction actionWithTitle:@"系统默认微信" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-                WXLOG(@"用户选择：系统默认");
-                gWXDialoging = NO;
-                gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 25.0;
-                WXSBHideOverlayDelayed();
-                NSURL *u3 = url;
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                    WXLOG(@"后台线程开始拉起 com.tencent.xin");
-                    WXSBLaunchByBundle(u3, @"com.tencent.xin");
-                });
-            }]];
             [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
                 WXLOG(@"用户取消");
                 gWXDialoging = NO;
