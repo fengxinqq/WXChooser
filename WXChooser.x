@@ -38,8 +38,9 @@ static volatile BOOL gWXDialoging = NO;
 static CFAbsoluteTime gWXCooldownUntil = 0;
 static NSString *gWXLastWXURL = nil;
 static UIImage *WXAppIcon(NSString *bid);
-static UIImage *WXRealIconForBid(NSString *bid);
+static UIImage *WXRealIconForBid(NSString *bid, NSString *path);
 static NSString *WXRealNameForBid(NSString *bid);
+static NSString *WXNameFromAppPath(NSString *dir);
 static UIViewController *gWXHostVC = nil;
 static void WXSBHideOverlay(void);
 static BOOL WXSBEnsureOverlay(void);
@@ -186,7 +187,7 @@ static NSArray<NSDictionary *> *WXScanWeChatApps(void) {
         if (![name isKindOfClass:[NSString class]]) name = bid;
         NSArray *schemes = WXSchemesOfPlist(pl);
         if (!WXLooksLikeWeChat(bid, name, schemes)) continue;
-        [out addObject:@{@"bid": bid, @"name": name, @"schemes": schemes}];
+        [out addObject:@{@"bid": bid, @"name": name, @"schemes": schemes, @"path": p}];
     }
     if (out.count == 0) {
         WXLOG(@"文件系统扫不到微信类应用，改用 LaunchServices");
@@ -217,7 +218,13 @@ static NSArray<NSDictionary *> *WXScanViaLSWorkspace(void) {
                 }
             } @catch (NSException *e) {}
             if (!WXLooksLikeWeChat(bid, name, schemes)) continue;
-            [out addObject:@{@"bid": bid, @"name": name.length ? name : bid, @"schemes": schemes}];
+            NSDictionary *item = @{@"bid": bid, @"name": name.length ? name : bid, @"schemes": schemes};
+            NSMutableDictionary *mi = [item mutableCopy];
+            @try {
+                id burl2 = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(bundleURL));
+                if ([burl2 isKindOfClass:[NSURL class]]) mi[@"path"] = [(NSURL *)burl2 path];
+            } @catch (NSException *e) {}
+            [out addObject:mi];
         }
         WXLOG(@"LSW: 枚举到 %lu 个微信类应用", (unsigned long)out.count);
     } @catch (NSException *e) {
@@ -269,9 +276,10 @@ static NSArray<NSDictionary *> *WXCandidatesForURL(NSURL *url) {
         for (NSString *s in a[@"schemes"]) {
             if (WXIsWeixinScheme(s)) { fallback = s; break; }
         }
-        NSString *dispName = WXRealNameForBid(bid) ?: a[@"name"];
-        if (!dispName.length) dispName = bid;
+        NSString *dispName = WXNameFromAppPath(a[@"path"]) ?: a[@"name"];
+        if (!dispName.length) dispName = WXRealNameForBid(bid) ?: bid;
         NSMutableDictionary *m = [@{@"bid": bid, @"name": dispName ?: bid} mutableCopy];
+        if ([a[@"path"] isKindOfClass:[NSString class]]) m[@"path"] = a[@"path"];
         if (uniq) m[@"scheme"] = uniq;
         if (fallback) m[@"wxScheme"] = fallback;
         [res addObject:m];
@@ -514,6 +522,16 @@ static void WXSetActionIcon(UIAlertAction *a) {
     @try { [a setValue:img forKey:@"image"]; } @catch (NSException *e) { }
 }
 
+static NSString *WXNameFromAppPath(NSString *dir) {
+    if (!dir.length) return nil;
+    NSDictionary *pl = [NSDictionary dictionaryWithContentsOfFile:[dir stringByAppendingPathComponent:@"Info.plist"]];
+    if (![pl isKindOfClass:[NSDictionary class]]) return nil;
+    id n = pl[@"CFBundleDisplayName"];
+    if (![n isKindOfClass:[NSString class]] || ![n length]) n = pl[@"CFBundleName"];
+    if ([n isKindOfClass:[NSString class]] && [n length]) return n;
+    return nil;
+}
+
 static NSString *WXRealNameForBid(NSString *bid) {
     if (!bid.length) return nil;
     static NSMutableDictionary *cache = nil;
@@ -532,36 +550,110 @@ static NSString *WXRealNameForBid(NSString *bid) {
     return name;
 }
 
-static UIImage *WXRealIconForBid(NSString *bid) {
-    if (!bid.length) return nil;
+static UIImage *WXIconFromAppPath(NSString *dir) {
+    if (!dir.length) return nil;
     static NSMutableDictionary *cache = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
-    UIImage *hit = cache[bid];
+    UIImage *hit = cache[dir];
     if ([hit isKindOfClass:[UIImage class]]) return hit;
-    UIImage *img = nil;
-    Class ui = NSClassFromString(@"UIImage");
-    @try {
-        SEL s2 = NSSelectorFromString(@"_applicationIconImageForBundleIdentifier:format:scale:");
-        if ([ui respondsToSelector:s2]) {
-            img = ((id (*)(id, SEL, id, unsigned int, double))objc_msgSend)(ui, s2, bid, 0, (double)[UIScreen mainScreen].scale);
+    NSDictionary *pl = [NSDictionary dictionaryWithContentsOfFile:[dir stringByAppendingPathComponent:@"Info.plist"]];
+    NSMutableArray *names = [NSMutableArray array];
+    if ([pl isKindOfClass:[NSDictionary class]]) {
+        id icons = pl[@"CFBundleIcons"];
+        if ([icons isKindOfClass:[NSDictionary class]]) {
+            id primary = ((NSDictionary *)icons)[@"CFBundlePrimaryIcon"];
+            if ([primary isKindOfClass:[NSDictionary class]]) {
+                id files = ((NSDictionary *)primary)[@"CFBundleIconFiles"];
+                if ([files isKindOfClass:[NSArray class]] && [files count]) {
+                    NSString *base = [(NSArray *)files lastObject];
+                    [names addObject:[base stringByAppendingString:@"@3x.png"]];
+                    [names addObject:[base stringByAppendingString:@"@2x.png"]];
+                    [names addObject:[base stringByAppendingString:@".png"]];
+                }
+            }
         }
-        if (![img isKindOfClass:[UIImage class]]) {
-            SEL s1 = NSSelectorFromString(@"_applicationIconImageForBundleIdentifier:");
-            if ([ui respondsToSelector:s1]) img = ((id (*)(id, SEL, id))objc_msgSend)(ui, s1, bid);
+        id single = pl[@"CFBundleIconFile"];
+        if ([single isKindOfClass:[NSString class]] && [single length]) {
+            [names addObject:(NSString *)single];
+            [names addObject:[(NSString *)single stringByAppendingString:@".png"]];
         }
-    } @catch (NSException *e) { }
-    if (![img isKindOfClass:[UIImage class]]) img = WXAppIcon(bid);
-    if ([img isKindOfClass:[UIImage class]] && img.size.width > 0) {
-        UIImage *src = img;
-        UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(29, 29)];
-        img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-            UIBezierPath *clip = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, 29, 29) cornerRadius:6.5];
-            [clip addClip];
-            [src drawInRect:CGRectMake(0, 0, 29, 29)];
-        }];
-        cache[bid] = img;
     }
+    [names addObject:@"AppIcon60x60@3x.png"];
+    [names addObject:@"AppIcon60x60@2x.png"];
+    [names addObject:@"AppIcon60x60.png"];
+    [names addObject:@"Icon@120x120.png"];
+    [names addObject:@"Icon-60@3x.png"];
+    UIImage *img = nil;
+    for (NSString *n in names) {
+        NSString *full = [dir stringByAppendingPathComponent:n];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:full]) {
+            img = [UIImage imageWithContentsOfFile:full];
+            if ([img isKindOfClass:[UIImage class]]) { WXLOG(@"图标取自文件 %@", full); break; }
+        }
+    }
+    if ([img isKindOfClass:[UIImage class]]) cache[dir] = img;
+    return img;
+}
+
+static UIImage *WXIconViaProxy(NSString *bid) {
+    if (!bid.length) return nil;
+    Class pc = NSClassFromString(@"LSApplicationProxy");
+    if (!pc) return nil;
+    id proxy = nil;
+    @try {
+        SEL s = NSSelectorFromString(@"applicationProxyForIdentifier:");
+        if ([pc respondsToSelector:s]) proxy = ((id (*)(id, SEL, id))objc_msgSend)(pc, s, bid);
+    } @catch (NSException *e) { }
+    if (!proxy) return nil;
+    SEL dSel = NSSelectorFromString(@"iconDataForVariant:");
+    if ([proxy respondsToSelector:dSel]) {
+        for (unsigned int v = 0; v <= 4; v++) {
+            @try {
+                id data = ((id (*)(id, SEL, unsigned int))objc_msgSend)(proxy, dSel, v);
+                if ([data isKindOfClass:[NSData class]] && [(NSData *)data length] > 64) {
+                    UIImage *im = [UIImage imageWithData:(NSData *)data];
+                    if ([im isKindOfClass:[UIImage class]]) { WXLOG(@"图标取自 proxy variant=%u", v); return im; }
+                }
+            } @catch (NSException *e) { }
+        }
+    }
+    return nil;
+}
+
+static UIImage *WXRealIconForBid(NSString *bid, NSString *path) {
+    NSString *key = bid.length ? bid : @"(空)";
+    static NSMutableDictionary *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    UIImage *hit = cache[key];
+    if ([hit isKindOfClass:[UIImage class]]) return hit;
+    UIImage *img = WXIconFromAppPath(path);
+    if (![img isKindOfClass:[UIImage class]]) img = WXIconViaProxy(bid);
+    if (![img isKindOfClass:[UIImage class]]) {
+        Class ui = NSClassFromString(@"UIImage");
+        @try {
+            SEL s2 = NSSelectorFromString(@"_applicationIconImageForBundleIdentifier:format:scale:");
+            if ([ui respondsToSelector:s2]) {
+                img = ((id (*)(id, SEL, id, unsigned int, double))objc_msgSend)(ui, s2, bid, 0, (double)[UIScreen mainScreen].scale);
+            }
+            if (![img isKindOfClass:[UIImage class]]) {
+                SEL s1 = NSSelectorFromString(@"_applicationIconImageForBundleIdentifier:");
+                if ([ui respondsToSelector:s1]) img = ((id (*)(id, SEL, id))objc_msgSend)(ui, s1, bid);
+            }
+        } @catch (NSException *e) { }
+    }
+    if (![img isKindOfClass:[UIImage class]]) img = WXAppIcon(bid);
+    if (![img isKindOfClass:[UIImage class]]) { WXLOG(@"取不到图标 bid=%@ path=%@", bid, path ?: @"(无)"); return nil; }
+    UIImage *src = img;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(29, 29)];
+    img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        UIBezierPath *clip = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, 29, 29) cornerRadius:6.5];
+        [clip addClip];
+        [src drawInRect:CGRectMake(0, 0, 29, 29)];
+    }];
+    img = [img imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
+    cache[key] = img;
     return img;
 }
 
@@ -578,10 +670,10 @@ static NSAttributedString *WXActionTitleText(NSString *title, UIImage *icon) {
     return m;
 }
 
-static void WXStyleAction(UIAlertAction *a, NSString *bid, NSString *title) {
+static void WXStyleAction(UIAlertAction *a, NSDictionary *cand, NSString *title) {
     if (!a) return;
-    UIImage *icon = WXRealIconForBid(bid);
-    if (![icon isKindOfClass:[UIImage class]]) { WXSetActionIcon(a); return; }
+    UIImage *icon = WXRealIconForBid(cand[@"bid"], cand[@"path"]);
+    if (![icon isKindOfClass:[UIImage class]]) return;
     NSAttributedString *attr = WXActionTitleText(title, icon);
     BOOL ok = NO;
     if (attr) { @try { [a setValue:attr forKey:@"attributedTitle"]; ok = YES; } @catch (NSException *e) { } }
@@ -616,7 +708,7 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
                 completion(YES);
             }
         }];
-        WXStyleAction(act, cand[@"bid"], title);
+        WXStyleAction(act, cand, title);
         [ac addAction:act];
     }
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
@@ -1019,7 +1111,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                         WXSBLaunchByBundle(u2, bid);
                     });
                 }];
-                WXStyleAction(act, bid, nm);
+                WXStyleAction(act, cand, nm);
                 [ac addAction:act];
             }
             [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
