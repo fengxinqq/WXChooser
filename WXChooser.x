@@ -267,6 +267,11 @@ static NSArray<NSDictionary *> *WXCandidatesForURL(NSURL *url) {
     for (NSDictionary *a in all) {
         NSString *bid = a[@"bid"];
         if ([bid isEqualToString:WXSelfBundleID()]) continue;
+        BOOL dup = NO;
+        for (NSDictionary *r in res) {
+            if ([r[@"bid"] isEqualToString:bid]) { dup = YES; break; }
+        }
+        if (dup) continue;
         NSString *uniq = nil;
         NSString *fallback = nil;
         for (NSString *s in a[@"schemes"]) {
@@ -278,6 +283,8 @@ static NSArray<NSDictionary *> *WXCandidatesForURL(NSURL *url) {
         }
         NSString *dispName = WXNameFromAppPath(a[@"path"]) ?: a[@"name"];
         if (!dispName.length) dispName = WXRealNameForBid(bid) ?: bid;
+        // 1.30：两个包 Info.plist 里都写「微信」，分身按包名还原成桌面上的名字
+        if ([bid isEqualToString:@"com.tencent.xinapp"] && [dispName isEqualToString:@"微信"]) dispName = @"如果";
         NSMutableDictionary *m = [@{@"bid": bid, @"name": dispName ?: bid} mutableCopy];
         if ([a[@"path"] isKindOfClass:[NSString class]]) m[@"path"] = a[@"path"];
         if (uniq) m[@"scheme"] = uniq;
@@ -628,8 +635,8 @@ static UIImage *WXRealIconForBid(NSString *bid, NSString *path) {
     dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
     UIImage *hit = cache[key];
     if ([hit isKindOfClass:[UIImage class]]) return hit;
-    UIImage *img = WXIconFromAppPath(path);
-    if (![img isKindOfClass:[UIImage class]]) img = WXIconViaProxy(bid);
+    UIImage *img = WXIconViaProxy(bid);
+    if (![img isKindOfClass:[UIImage class]]) img = WXIconFromAppPath(path);
     if (![img isKindOfClass:[UIImage class]]) {
         Class ui = NSClassFromString(@"UIImage");
         @try {
