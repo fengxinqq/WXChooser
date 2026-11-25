@@ -37,6 +37,9 @@ static volatile BOOL gWXBusy = NO;
 static volatile BOOL gWXDialoging = NO;
 static CFAbsoluteTime gWXCooldownUntil = 0;
 static NSString *gWXLastWXURL = nil;
+static UIViewController *gWXHostVC = nil;
+static void WXSBHideOverlay(void);
+static BOOL WXSBEnsureOverlay(void);
 
 static NSString *WXSelfBundleID(void) {
     static NSString *bid = nil;
@@ -773,8 +776,6 @@ static void WXSBHideOverlay(void) {
         WXLOG(@"关闭弹框异常 %@", e.reason);
     }
 }
-
-static UIViewController *gWXHostVC = nil;
 
 static BOOL WXSBEnsureOverlay(void) {
     if (gWXHostVC) return YES;
