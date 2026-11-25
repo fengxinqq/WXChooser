@@ -38,6 +38,8 @@ static volatile BOOL gWXDialoging = NO;
 static CFAbsoluteTime gWXCooldownUntil = 0;
 static NSString *gWXLastWXURL = nil;
 static UIImage *WXAppIcon(NSString *bid);
+static UIImage *WXRealIconForBid(NSString *bid);
+static NSString *WXRealNameForBid(NSString *bid);
 static UIViewController *gWXHostVC = nil;
 static void WXSBHideOverlay(void);
 static BOOL WXSBEnsureOverlay(void);
@@ -267,10 +269,8 @@ static NSArray<NSDictionary *> *WXCandidatesForURL(NSURL *url) {
         for (NSString *s in a[@"schemes"]) {
             if (WXIsWeixinScheme(s)) { fallback = s; break; }
         }
-        NSString *dispName = a[@"name"];
-        // 1.18：分身包自带的显示名也叫“微信”，这里强制区分
-        if ([bid isEqualToString:@"com.tencent.xin"]) dispName = @"微信";
-        else if ([bid isEqualToString:@"com.tencent.xinapp"]) dispName = @"如果";
+        NSString *dispName = WXRealNameForBid(bid) ?: a[@"name"];
+        if (!dispName.length) dispName = bid;
         NSMutableDictionary *m = [@{@"bid": bid, @"name": dispName ?: bid} mutableCopy];
         if (uniq) m[@"scheme"] = uniq;
         if (fallback) m[@"wxScheme"] = fallback;
@@ -514,6 +514,80 @@ static void WXSetActionIcon(UIAlertAction *a) {
     @try { [a setValue:img forKey:@"image"]; } @catch (NSException *e) { }
 }
 
+static NSString *WXRealNameForBid(NSString *bid) {
+    if (!bid.length) return nil;
+    static NSMutableDictionary *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    NSString *hit = cache[bid];
+    if ([hit isKindOfClass:[NSString class]]) return hit;
+    NSString *name = nil;
+    @try {
+        Class cls = NSClassFromString(@"LSApplicationWorkspace");
+        id ws = ((id (*)(id, SEL))objc_msgSend)(cls, NSSelectorFromString(@"defaultWorkspace"));
+        id proxy = ((id (*)(id, SEL, id))objc_msgSend)(ws, NSSelectorFromString(@"applicationForBundleIdentifier:"), bid);
+        name = ((id (*)(id, SEL))objc_msgSend)(proxy, NSSelectorFromString(@"localizedName"));
+    } @catch (NSException *e) { }
+    if ([name isKindOfClass:[NSString class]] && name.length) cache[bid] = name;
+    return name;
+}
+
+static UIImage *WXRealIconForBid(NSString *bid) {
+    if (!bid.length) return nil;
+    static NSMutableDictionary *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    UIImage *hit = cache[bid];
+    if ([hit isKindOfClass:[UIImage class]]) return hit;
+    UIImage *img = nil;
+    Class ui = NSClassFromString(@"UIImage");
+    @try {
+        SEL s2 = NSSelectorFromString(@"_applicationIconImageForBundleIdentifier:format:scale:");
+        if ([ui respondsToSelector:s2]) {
+            img = ((id (*)(id, SEL, id, unsigned int, double))objc_msgSend)(ui, s2, bid, 0, (double)[UIScreen mainScreen].scale);
+        }
+        if (![img isKindOfClass:[UIImage class]]) {
+            SEL s1 = NSSelectorFromString(@"_applicationIconImageForBundleIdentifier:");
+            if ([ui respondsToSelector:s1]) img = ((id (*)(id, SEL, id))objc_msgSend)(ui, s1, bid);
+        }
+    } @catch (NSException *e) { }
+    if (![img isKindOfClass:[UIImage class]]) img = WXAppIcon(bid);
+    if ([img isKindOfClass:[UIImage class]] && img.size.width > 0) {
+        UIImage *src = img;
+        UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(29, 29)];
+        img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+            UIBezierPath *clip = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, 29, 29) cornerRadius:6.5];
+            [clip addClip];
+            [src drawInRect:CGRectMake(0, 0, 29, 29)];
+        }];
+        cache[bid] = img;
+    }
+    return img;
+}
+
+static NSAttributedString *WXActionTitleText(NSString *title, UIImage *icon) {
+    if (![icon isKindOfClass:[UIImage class]]) return nil;
+    if (!title.length) title = @"";
+    NSTextAttachment *att = [[NSTextAttachment alloc] init];
+    att.image = icon;
+    att.bounds = CGRectMake(2, -6, 24, 24);
+    NSMutableAttributedString *m = [[NSMutableAttributedString alloc] initWithAttributedString:[NSAttributedString attributedStringWithAttachment:att]];
+    NSDictionary *attrs = @{ NSFontAttributeName : [UIFont systemFontOfSize:17 weight:UIFontWeightMedium],
+                             NSForegroundColorAttributeName : [UIColor labelColor] };
+    [m appendAttributedString:[[NSAttributedString alloc] initWithString:[@"  " stringByAppendingString:title] attributes:attrs]];
+    return m;
+}
+
+static void WXStyleAction(UIAlertAction *a, NSString *bid, NSString *title) {
+    if (!a) return;
+    UIImage *icon = WXRealIconForBid(bid);
+    if (![icon isKindOfClass:[UIImage class]]) { WXSetActionIcon(a); return; }
+    NSAttributedString *attr = WXActionTitleText(title, icon);
+    BOOL ok = NO;
+    if (attr) { @try { [a setValue:attr forKey:@"attributedTitle"]; ok = YES; } @catch (NSException *e) { } }
+    if (!ok) { @try { [a setValue:icon forKey:@"image"]; } @catch (NSException *e) { } }
+}
+
 static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDictionary *options, void (^completion)(BOOL)) {
     UIViewController *top = WXTopViewController();
     if (!top) { WXLOG(@"找不到顶层控制器，直接放行"); completion(YES); return; }
@@ -542,7 +616,7 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
                 completion(YES);
             }
         }];
-        WXSetActionIcon(act);
+        WXStyleAction(act, cand[@"bid"], title);
         [ac addAction:act];
     }
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
@@ -945,7 +1019,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                         WXSBLaunchByBundle(u2, bid);
                     });
                 }];
-                WXSetActionIcon(act);
+                WXStyleAction(act, bid, nm);
                 [ac addAction:act];
             }
             [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
