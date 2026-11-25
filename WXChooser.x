@@ -38,6 +38,7 @@ static volatile BOOL gWXDialoging = NO;
 static CFAbsoluteTime gWXCooldownUntil = 0;
 static NSString *gWXLastWXURL = nil;
 static UIViewController *gWXHostVC = nil;
+static UIAlertController *gWXAlertVC = nil;
 static void WXSBHideOverlay(void);
 static BOOL WXSBEnsureOverlay(void);
 
@@ -447,6 +448,7 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
     for (NSDictionary *cand in cands) {
         NSString *title = cand[@"name"] ?: cand[@"bid"];
         [ac addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            [ac dismissViewControllerAnimated:NO completion:nil];
             BOOL handled = NO;
             NSString *scheme = cand[@"scheme"];
             NSString *bid = cand[@"bid"];
@@ -792,14 +794,37 @@ static BOOL WXReplayInner(void) {
 
 static void WXSBHideOverlay(void) {
     @try {
+        if (gWXAlertVC) {
+            [gWXAlertVC dismissViewControllerAnimated:NO completion:nil];
+            gWXAlertVC = nil;
+        }
         if (gWXHostVC && gWXHostVC.presentedViewController) {
             [gWXHostVC dismissViewControllerAnimated:NO completion:nil];
+        }
+        // 1.19：兜底扫一遍所有窗口，把还挂着的“打开微信”弹框关掉，避免桌面残影
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            UIViewController *vc = w.rootViewController;
+            for (int i = 0; i < 4 && vc; i++) {
+                UIViewController *pv = vc.presentedViewController;
+                if (!pv) break;
+                if ([pv isKindOfClass:[UIAlertController class]] &&
+                    [((UIAlertController *)pv).title isEqualToString:@"打开微信"]) {
+                    [pv dismissViewControllerAnimated:NO completion:nil];
+                }
+                vc = pv;
+            }
         }
         gWXOverlayVisible = NO;
         WXLOG(@"SB 弹框已关闭");
     } @catch (NSException *e) {
         WXLOG(@"关闭弹框异常 %@", e.reason);
     }
+}
+
+static void WXSBHideOverlayDelayed(void) {
+    WXSBHideOverlay();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ WXSBHideOverlay(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ WXSBHideOverlay(); });
 }
 
 static BOOL WXSBEnsureOverlay(void) {
@@ -860,7 +885,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                     WXLOG(@"用户选择：%@ (%@)", nm, bid);
                     gWXDialoging = NO;
                     gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 25.0;
-                    WXSBHideOverlay();
+                    WXSBHideOverlayDelayed();
                     NSURL *u2 = url;
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
                         WXLOG(@"后台线程开始拉起 %@", bid);
@@ -872,7 +897,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                 WXLOG(@"用户选择：系统默认");
                 gWXDialoging = NO;
                 gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 25.0;
-                WXSBHideOverlay();
+                WXSBHideOverlayDelayed();
                 NSURL *u3 = url;
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
                     WXLOG(@"后台线程开始拉起 com.tencent.xin");
@@ -883,8 +908,9 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                 WXLOG(@"用户取消");
                 gWXDialoging = NO;
                 gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 25.0;
-                WXSBHideOverlay();
+                WXSBHideOverlayDelayed();
             }]];
+            gWXAlertVC = ac;
             [gWXHostVC presentViewController:ac animated:NO completion:^{
                 WXSetGuard(NO);
                 WXLOG(@"SB 弹框已呈现");
