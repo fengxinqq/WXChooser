@@ -38,7 +38,9 @@ static volatile BOOL gWXDialoging = NO;
 static CFAbsoluteTime gWXCooldownUntil = 0;
 static NSString *gWXLastWXURL = nil;
 static UIViewController *gWXHostVC = nil;
-static UIAlertController *gWXAlertVC = nil;
+static UIViewController *gWXChooserVC = nil;
+static UIImage *WXAppIcon(NSString *bid);
+static void WXSBLaunchByBundle(NSURL *url, NSString *bid);
 static void WXSBHideOverlay(void);
 static BOOL WXSBEnsureOverlay(void);
 
@@ -436,47 +438,218 @@ static void WXDumpLaunchAPIs(void) {
     for (NSUInteger i = 0; i < limit; i++) WXLOG(@"  D %@", lines[i]);
 }
 
+
+#pragma mark - 自绘居中卡片（带微信头像）
+
+static UIImage *WXAppIcon(NSString *bid) {
+    static NSMutableDictionary *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    if (!bid.length) return nil;
+    UIImage *hit = cache[bid];
+    if (hit) return hit;
+    UIImage *img = nil;
+    @try {
+        Class cls = NSClassFromString(@"LSApplicationWorkspace");
+        id ws = ((id (*)(id, SEL))objc_msgSend)(cls, NSSelectorFromString(@"defaultWorkspace"));
+        id proxy = ((id (*)(id, SEL, id))objc_msgSend)(ws, NSSelectorFromString(@"applicationForBundleIdentifier:"), bid);
+        id burl = ((id (*)(id, SEL))objc_msgSend)(proxy, NSSelectorFromString(@"bundleURL"));
+        if ([burl isKindOfClass:[NSURL class]]) {
+            NSURL *u = (NSURL *)burl;
+            NSString *dir = [u path];
+            NSDictionary *pl = [NSDictionary dictionaryWithContentsOfFile:[dir stringByAppendingPathComponent:@"Info.plist"]];
+            NSMutableArray *names = [NSMutableArray array];
+            if ([pl isKindOfClass:[NSDictionary class]]) {
+                id icons = pl[@"CFBundleIcons"];
+                if ([icons isKindOfClass:[NSDictionary class]]) {
+                    id primary = ((NSDictionary *)icons)[@"CFBundlePrimaryIcon"];
+                    if ([primary isKindOfClass:[NSDictionary class]]) {
+                        id files = ((NSDictionary *)primary)[@"CFBundleIconFiles"];
+                        if ([files isKindOfClass:[NSArray class]] && [files count]) {
+                            NSString *base = [(NSArray *)files lastObject];
+                            [names addObject:[base stringByAppendingString:@"@3x.png"]];
+                            [names addObject:[base stringByAppendingString:@"@2x.png"]];
+                            [names addObject:[base stringByAppendingString:@".png"]];
+                        }
+                    }
+                }
+                id single = pl[@"CFBundleIconFile"];
+                if ([single isKindOfClass:[NSString class]] && [single length]) {
+                    [names addObject:(NSString *)single];
+                    [names addObject:[(NSString *)single stringByAppendingString:@".png"]];
+                }
+            }
+            [names addObject:@"AppIcon60x60@3x.png"];
+            [names addObject:@"AppIcon60x60@2x.png"];
+            [names addObject:@"Icon@120x120.png"];
+            for (NSString *n in names) {
+                NSString *full = [dir stringByAppendingPathComponent:n];
+                if ([[NSFileManager defaultManager] fileExistsAtPath:full]) {
+                    img = [UIImage imageWithContentsOfFile:full];
+                    if (img) break;
+                }
+            }
+        }
+    } @catch (NSException *e) { }
+    if (img) cache[bid] = img;
+    return img;
+}
+
+@interface WXChooserCardVC : UIViewController
+@property (nonatomic, strong) NSArray *items;
+@property (nonatomic, copy) void (^onPick)(NSInteger index);
+@property (nonatomic, copy) void (^onCancel)(void);
+@end
+
+@implementation WXChooserCardVC {
+    UIView *_card;
+    BOOL _built;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.35];
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(bgTap:)];
+    tap.cancelsTouchesInView = NO;
+    [self.view addGestureRecognizer:tap];
+}
+
+- (void)viewWillLayoutSubviews {
+    [super viewWillLayoutSubviews];
+    if (_built) return;
+    _built = YES;
+    [self buildCard];
+}
+
+- (void)bgTap:(UITapGestureRecognizer *)g {
+    CGPoint p = [g locationInView:self.view];
+    if (_card && CGRectContainsPoint(_card.frame, p)) return;
+    if (self.onCancel) self.onCancel();
+    [self dismissViewControllerAnimated:NO completion:nil];
+}
+
+- (void)buildCard {
+    CGFloat W = 304.0;
+    NSInteger n = (NSInteger)self.items.count;
+    CGFloat titleH = 66.0, rowH = 64.0, gap = 10.0, cancelH = 54.0;
+    CGFloat H = titleH + rowH * n + gap + cancelH;
+    CGRect b = self.view.bounds;
+    _card = [[UIView alloc] initWithFrame:CGRectMake((b.size.width - W) / 2.0, (b.size.height - H) / 2.0, W, H)];
+    _card.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.97];
+    _card.layer.cornerRadius = 20.0;
+    _card.layer.masksToBounds = YES;
+    [self.view addSubview:_card];
+
+    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(0, 16, W, 22)];
+    t.text = @"打开微信";
+    t.font = [UIFont boldSystemFontOfSize:17];
+    t.textAlignment = NSTextAlignmentCenter;
+    t.textColor = [UIColor blackColor];
+    [_card addSubview:t];
+
+    UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(0, 40, W, 18)];
+    sub.text = @"选择要跳转的微信";
+    sub.font = [UIFont systemFontOfSize:12];
+    sub.textAlignment = NSTextAlignmentCenter;
+    sub.textColor = [UIColor grayColor];
+    [_card addSubview:sub];
+
+    for (NSInteger i = 0; i < n; i++) {
+        NSDictionary *it = self.items[i];
+        CGFloat y = titleH + rowH * i;
+        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+        btn.frame = CGRectMake(0, y, W, rowH);
+        btn.tag = i;
+        btn.backgroundColor = [UIColor clearColor];
+        [btn addTarget:self action:@selector(rowTap:) forControlEvents:UIControlEventTouchUpInside];
+        [_card addSubview:btn];
+
+        UIImage *icon = WXAppIcon(it[@"bid"]);
+        CGFloat tx = 20.0;
+        if (icon) {
+            UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(20, y + (rowH - 40) / 2.0, 40, 40)];
+            iv.image = icon;
+            iv.layer.cornerRadius = 9.0;
+            iv.layer.masksToBounds = YES;
+            iv.userInteractionEnabled = NO;
+            [_card addSubview:iv];
+            tx = 76.0;
+        }
+        UILabel *nm = [[UILabel alloc] initWithFrame:CGRectMake(tx, y, W - tx - 20, rowH)];
+        nm.text = it[@"name"] ?: it[@"bid"];
+        nm.font = [UIFont systemFontOfSize:17];
+        nm.textColor = [UIColor blackColor];
+        nm.userInteractionEnabled = NO;
+        [_card addSubview:nm];
+
+        UIView *line = [[UIView alloc] initWithFrame:CGRectMake(20, y + rowH - 0.5, W - 40, 0.5)];
+        line.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.10];
+        line.userInteractionEnabled = NO;
+        [_card addSubview:line];
+    }
+
+    UIButton *cancel = [UIButton buttonWithType:UIButtonTypeCustom];
+    cancel.frame = CGRectMake(0, titleH + rowH * n + gap, W, cancelH);
+    [cancel setTitle:@"取消" forState:UIControlStateNormal];
+    [cancel setTitleColor:[UIColor colorWithRed:0.0 green:0.48 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
+    cancel.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+    [cancel addTarget:self action:@selector(cancelTap:) forControlEvents:UIControlEventTouchUpInside];
+    [_card addSubview:cancel];
+}
+
+- (void)rowTap:(UIButton *)b {
+    if (self.onPick) self.onPick(b.tag);
+}
+
+- (void)cancelTap:(id)o {
+    if (self.onCancel) self.onCancel();
+}
+
+@end
+
+static UIViewController *WXMakeChooserCard(NSArray *cands, void (^pick)(NSInteger), void (^cancel)(void)) {
+    WXChooserCardVC *vc = [[WXChooserCardVC alloc] init];
+    vc.items = cands ?: @[];
+    vc.onPick = pick;
+    vc.onCancel = cancel;
+    vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
+    return vc;
+}
+
 static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDictionary *options, void (^completion)(BOOL)) {
     UIViewController *top = WXTopViewController();
     if (!top) { WXLOG(@"找不到顶层控制器，直接放行"); completion(YES); return; }
-
-    NSString *msg = cands.count ? @"选择要跳转的微信"
-                                : @"没识别到微信 App（可先点“系统默认”继续）";
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"打开微信"
-                                                               message:msg
-                                                        preferredStyle:UIAlertControllerStyleActionSheet];
-    for (NSDictionary *cand in cands) {
-        NSString *title = cand[@"name"] ?: cand[@"bid"];
-        [ac addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            [ac dismissViewControllerAnimated:NO completion:nil];
-            BOOL handled = NO;
-            NSString *scheme = cand[@"scheme"];
-            NSString *bid = cand[@"bid"];
-            if (bid.length) handled = WXOpenByBundleID(url, bid, nil);
-            if (!handled && scheme.length) handled = WXOpenByScheme(url, scheme, ^(BOOL ok) {
-                if (!ok) WXLOG(@"scheme 方式打开失败：%@", scheme);
-            });
-            if (!handled) handled = WXRequestSpringBoardLaunch(url, cand[@"bid"]);
-            if (!handled) handled = WXOpenByBundleID(url, cand[@"bid"], nil);
-            if (!handled) {
-                WXLOG(@"几种方式都失败，回退系统默认，目标=%@", cand[@"bid"]);
-                WXOpenPassthrough(url, options, completion);
-            } else if (completion) {
-                completion(YES);
-            }
-        }]];
-    }
-    [ac addAction:[UIAlertAction actionWithTitle:@"系统默认" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        WXOpenPassthrough(url, options, completion);
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
+    NSArray *snapshot = cands ?: @[];
+    __block NSArray *items = snapshot;
+    void (^pick)(NSInteger) = ^(NSInteger idx) {
+        if (gWXChooserVC) {
+            [gWXChooserVC dismissViewControllerAnimated:NO completion:nil];
+            gWXChooserVC = nil;
+        }
+        NSDictionary *cand = (idx >= 0 && idx < (NSInteger)items.count) ? items[idx] : nil;
+        if (!cand) { if (completion) completion(NO); return; }
+        BOOL handled = NO;
+        NSString *scheme = cand[@"scheme"];
+        NSString *bid = cand[@"bid"];
+        WXLOG(@"用户选择：%@ (%@)", cand[@"name"], bid);
+        if (bid.length) handled = WXOpenByBundleID(url, bid, nil);
+        if (!handled && scheme.length) handled = WXOpenByScheme(url, scheme, ^(BOOL ok) {
+            if (!ok) WXLOG(@"scheme 方式打开失败：%@", scheme);
+        });
+        if (!handled) handled = WXRequestSpringBoardLaunch(url, bid);
+        if (!handled) handled = WXOpenByBundleID(url, bid, nil);
+        if (!handled) {
+            WXLOG(@"几种方式都失败，回退系统默认，目标=%@", bid);
+            WXOpenPassthrough(url, options, completion);
+        } else if (completion) {
+            completion(YES);
+        }
+    };
+    WXChooserCardVC *vc = (WXChooserCardVC *)WXMakeChooserCard(items, pick, ^{
         if (completion) completion(NO);
-    }]];
-    if (ac.popoverPresentationController) {
-        ac.popoverPresentationController.sourceView = top.view;
-        ac.popoverPresentationController.sourceRect = CGRectMake(top.view.bounds.size.width / 2.0, top.view.bounds.size.height, 1, 1);
-    }
-    [top presentViewController:ac animated:YES completion:nil];
+    });
+    gWXChooserVC = vc;
+    [top presentViewController:vc animated:NO completion:nil];
 }
 
 // 返回 YES 表示已经由本插件接管（调用方应直接返回成功）
@@ -794,21 +967,21 @@ static BOOL WXReplayInner(void) {
 
 static void WXSBHideOverlay(void) {
     @try {
-        if (gWXAlertVC) {
-            [gWXAlertVC dismissViewControllerAnimated:NO completion:nil];
-            gWXAlertVC = nil;
+        if (gWXChooserVC) {
+            [gWXChooserVC dismissViewControllerAnimated:NO completion:nil];
+            gWXChooserVC = nil;
         }
         if (gWXHostVC && gWXHostVC.presentedViewController) {
             [gWXHostVC dismissViewControllerAnimated:NO completion:nil];
         }
-        // 1.19：兜底扫一遍所有窗口，把还挂着的“打开微信”弹框关掉，避免桌面残影
+        // 1.21：兜底扫一遍所有窗口，把还挂着的选择卡片关掉，避免桌面残影
         for (UIWindow *w in [UIApplication sharedApplication].windows) {
             UIViewController *vc = w.rootViewController;
             for (int i = 0; i < 4 && vc; i++) {
                 UIViewController *pv = vc.presentedViewController;
                 if (!pv) break;
-                if ([pv isKindOfClass:[UIAlertController class]] &&
-                    [((UIAlertController *)pv).title isEqualToString:@"打开微信"]) {
+                NSString *cn = NSStringFromClass([pv class]);
+                if ([cn isEqualToString:@"WXChooserCardVC"] || [pv isKindOfClass:[UIAlertController class]]) {
                     [pv dismissViewControllerAnimated:NO completion:nil];
                 }
                 vc = pv;
@@ -866,9 +1039,6 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
             UIViewController *top = gWXHostVC;
             while (top.presentedViewController) top = top.presentedViewController;
 
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"打开微信"
-                                                                       message:@"选择要跳转的微信"
-                                                                preferredStyle:UIAlertControllerStyleActionSheet];
             NSArray *snapshot = cands;
             if (url) {
                 snapshot = [cands sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
@@ -878,31 +1048,34 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                     return ao ? NSOrderedAscending : NSOrderedDescending;
                 }];
             }
-            for (NSDictionary *cand in snapshot) {
+            __block NSArray *items = snapshot;
+            void (^pick)(NSInteger) = ^(NSInteger idx) {
+                if (gWXChooserVC) {
+                    [gWXChooserVC dismissViewControllerAnimated:NO completion:nil];
+                    gWXChooserVC = nil;
+                }
+                NSDictionary *cand = (idx >= 0 && idx < (NSInteger)items.count) ? items[idx] : nil;
                 NSString *bid = cand[@"bid"];
-                NSString *nm = cand[@"name"] ?: bid;
-                [ac addAction:[UIAlertAction actionWithTitle:nm style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-                    WXLOG(@"用户选择：%@ (%@)", nm, bid);
-                    gWXDialoging = NO;
-                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 25.0;
-                    WXSBHideOverlayDelayed();
-                    NSURL *u2 = url;
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                        WXLOG(@"后台线程开始拉起 %@", bid);
-                        WXSBLaunchByBundle(u2, bid);
-                    });
-                }]];
-            }
-            [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
+                WXLOG(@"用户选择：%@ (%@)", cand[@"name"], bid);
+                gWXDialoging = NO;
+                gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 25.0;
+                WXSBHideOverlayDelayed();
+                NSURL *u2 = url;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    WXLOG(@"后台线程开始拉起 %@", bid);
+                    WXSBLaunchByBundle(u2, bid);
+                });
+            };
+            WXChooserCardVC *vc = (WXChooserCardVC *)WXMakeChooserCard(items, pick, ^{
                 WXLOG(@"用户取消");
                 gWXDialoging = NO;
                 gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 25.0;
                 WXSBHideOverlayDelayed();
-            }]];
-            gWXAlertVC = ac;
-            [gWXHostVC presentViewController:ac animated:NO completion:^{
+            });
+            gWXChooserVC = vc;
+            [gWXHostVC presentViewController:vc animated:NO completion:^{
                 WXSetGuard(NO);
-                WXLOG(@"SB 弹框已呈现");
+                WXLOG(@"SB 卡片已呈现");
             }];
         } @catch (NSException *e) {
             WXLOG(@"SB 弹框异常 %@", e.reason);
