@@ -1,0 +1,24 @@
+name: build15i
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: brew install ldid xz dpkg
+      - name: theos
+        run: |
+          git clone --recursive --depth 1 https://github.com/roothide/theos ~/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          echo "$HOME/theos/bin" >> $GITHUB_PATH
+      - name: sdk
+        run: |
+          curl -sL https://github.com/theos/sdks/archive/master.tar.gz -o /tmp/sdks.tgz
+          mkdir -p ~/theos/sdks && tar xzf /tmp/sdks.tgz -C ~/theos/sdks --strip-components=1
+      - name: build
+        run: make clean package FINALPACKAGE=1 _THEOS_PLATFORM_DPKG_DEB=dpkg-deb THEOS_PLATFORM_DEB_COMPRESSION_TYPE=xz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WXChooser-deb15i
+          path: packages/*.deb
