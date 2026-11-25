@@ -223,8 +223,29 @@ static NSArray<NSDictionary *> *WXScanViaLSWorkspace(void) {
     return out;
 }
 
+static NSDictionary *WXKnownCandidate(NSString *bid, NSString *name) {
+    return @{@"bid": bid ?: @"", @"name": name ?: bid ?: @"", @"schemes": @[@"weixin"]};
+}
+
 static NSArray<NSDictionary *> *WXCandidatesForURL(NSURL *url) {
     NSArray *all = WXScanWeChatApps();
+    // 1.17：沙盒应用里扫不到 App 列表时，至少保证两个已知微信永远可选
+    {
+        NSMutableArray *merged = [all mutableCopy] ?: [NSMutableArray array];
+        NSArray *known = @[ WXKnownCandidate(@"com.tencent.xin", @"微信"),
+                            WXKnownCandidate(@"com.tencent.xinapp", @"如果") ];
+        for (NSDictionary *k in known) {
+            BOOL exists = NO;
+            for (NSDictionary *a in all) {
+                if ([a[@"bid"] isEqualToString:k[@"bid"]]) { exists = YES; break; }
+            }
+            if (!exists) {
+                [merged addObject:k];
+                WXLOG(@"候选不足，补入已知微信 %@ %@", k[@"bid"], k[@"name"]);
+            }
+        }
+        all = merged;
+    }
     NSMutableDictionary *counts = [NSMutableDictionary dictionary];
     for (NSDictionary *b in all) {
         for (NSString *s in b[@"schemes"]) {
