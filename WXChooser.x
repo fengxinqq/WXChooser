@@ -266,7 +266,11 @@ static NSArray<NSDictionary *> *WXCandidatesForURL(NSURL *url) {
         for (NSString *s in a[@"schemes"]) {
             if (WXIsWeixinScheme(s)) { fallback = s; break; }
         }
-        NSMutableDictionary *m = [@{@"bid": bid, @"name": a[@"name"]} mutableCopy];
+        NSString *dispName = a[@"name"];
+        // 1.18：分身包自带的显示名也叫“微信”，这里强制区分
+        if ([bid isEqualToString:@"com.tencent.xin"]) dispName = @"微信";
+        else if ([bid isEqualToString:@"com.tencent.xinapp"]) dispName = @"如果";
+        NSMutableDictionary *m = [@{@"bid": bid, @"name": dispName ?: bid} mutableCopy];
         if (uniq) m[@"scheme"] = uniq;
         if (fallback) m[@"wxScheme"] = fallback;
         [res addObject:m];
