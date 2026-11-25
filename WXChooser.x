@@ -680,9 +680,206 @@ static void WXStyleAction(UIAlertAction *a, NSDictionary *cand, NSString *title)
     if (!ok) { @try { [a setValue:icon forKey:@"image"]; } @catch (NSException *e) { } }
 }
 
+#pragma mark - 自绘底部菜单（图标与名字整行居中）
+
+@interface WXSheetRowTarget : NSObject
+- (void)onRowTap:(UIButton *)sender;
+- (void)onCancelTap:(UIButton *)sender;
+- (void)dismissSheet;
+@end
+
+static NSArray *gWXSheetCands = nil;
+static void (^gWXSheetPick)(NSDictionary *) = nil;
+static void (^gWXSheetCancel)(void) = nil;
+static UIView *gWXSheetContainer = nil;
+static WXSheetRowTarget *gWXSheetTarget = nil;
+
+@implementation WXSheetRowTarget
+- (void)dismissSheet {
+    UIView *c = gWXSheetContainer;
+    gWXSheetContainer = nil;
+    gWXSheetCands = nil;
+    gWXSheetPick = nil;
+    gWXSheetCancel = nil;
+    if (!c) return;
+    [UIView animateWithDuration:0.16 animations:^{ c.alpha = 0.0; } completion:^(BOOL finished) { [c removeFromSuperview]; }];
+}
+- (void)onRowTap:(UIButton *)sender {
+    NSInteger idx = sender.tag;
+    NSArray *cands = gWXSheetCands;
+    void (^pick)(NSDictionary *) = gWXSheetPick;
+    gWXSheetPick = nil;
+    gWXSheetCancel = nil;
+    gWXSheetCands = nil;
+    [self dismissSheet];
+    if (cands && idx >= 0 && idx < (NSInteger)cands.count && pick) pick(cands[idx]);
+}
+- (void)onCancelTap:(UIButton *)sender {
+    void (^cancel)(void) = gWXSheetCancel;
+    gWXSheetPick = nil;
+    gWXSheetCancel = nil;
+    gWXSheetCands = nil;
+    [self dismissSheet];
+    if (cancel) cancel();
+}
+@end
+
+static BOOL WXShowSheet(UIView *host, NSArray<NSDictionary *> *cands, void (^pick)(NSDictionary *), void (^cancel)(void)) {
+    if (!host || ![host isKindOfClass:[UIView class]]) return NO;
+    BOOL ok = NO;
+    @try {
+        UIView *old = gWXSheetContainer;
+        gWXSheetContainer = nil;
+        if (old) [old removeFromSuperview];
+
+        gWXSheetCands = [cands copy];
+        gWXSheetPick = [pick copy];
+        gWXSheetCancel = [cancel copy];
+
+        CGRect b = host.bounds;
+        CGFloat headerH = 56.0, rowH = 58.0, cancelH = 52.0, gap = 8.0, bottomInset = 26.0;
+        UIWindow *win = host.window;
+        if (win) {
+            if (@available(iOS 11.0, *)) bottomInset = MAX(bottomInset, win.safeAreaInsets.bottom + 8.0);
+        }
+
+        CGFloat cardW = b.size.width - 16.0;
+        CGFloat cardH = headerH + rowH * (CGFloat)cands.count;
+        CGFloat cardY = b.size.height - bottomInset - cancelH - gap - cardH;
+
+        UIView *container = [[UIView alloc] initWithFrame:b];
+        container.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.34];
+        container.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        container.alpha = 0.0;
+
+        UIView *card = [[UIView alloc] initWithFrame:CGRectMake(8.0, cardY, cardW, cardH)];
+        card.backgroundColor = [UIColor secondarySystemBackgroundColor];
+        card.layer.cornerRadius = 14.0;
+        card.clipsToBounds = YES;
+
+        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 10.0, cardW, 20.0)];
+        title.text = @"打开微信";
+        title.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+        title.textColor = [UIColor secondaryLabelColor];
+        title.textAlignment = NSTextAlignmentCenter;
+        [card addSubview:title];
+
+        UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(0, 32.0, cardW, 18.0)];
+        sub.text = cands.count ? @"选择要跳转的微信" : @"没识别到微信 App";
+        sub.font = [UIFont systemFontOfSize:13];
+        sub.textColor = [UIColor tertiaryLabelColor];
+        sub.textAlignment = NSTextAlignmentCenter;
+        [card addSubview:sub];
+
+        UIView *hline = [[UIView alloc] initWithFrame:CGRectMake(0, headerH - 0.5, cardW, 0.5)];
+        hline.backgroundColor = [UIColor separatorColor];
+        [card addSubview:hline];
+
+        WXSheetRowTarget *target = [[WXSheetRowTarget alloc] init];
+        gWXSheetTarget = target;
+
+        for (NSUInteger i = 0; i < cands.count; i++) {
+            NSDictionary *cand = cands[i];
+            CGFloat y = headerH + rowH * (CGFloat)i;
+            UIButton *row = [UIButton buttonWithType:UIButtonTypeCustom];
+            row.frame = CGRectMake(0, y, cardW, rowH);
+            row.tag = (NSInteger)i;
+            [row addTarget:target action:@selector(onRowTap:) forControlEvents:UIControlEventTouchUpInside];
+
+            UIImage *icon = WXRealIconForBid(cand[@"bid"], cand[@"path"]);
+            NSString *nm = cand[@"name"] ?: cand[@"bid"];
+            UIFont *nf = [UIFont systemFontOfSize:17 weight:UIFontWeightMedium];
+            CGFloat tw = [nm sizeWithAttributes:@{NSFontAttributeName:nf}].width + 2.0;
+            CGFloat iconW = icon ? 26.0 : 0.0;
+            CGFloat spacing = icon ? 10.0 : 0.0;
+            CGFloat groupW = iconW + spacing + tw;
+            CGFloat gx = (cardW - groupW) / 2.0;
+
+            if (icon) {
+                UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(gx, (rowH - 26.0) / 2.0, 26.0, 26.0)];
+                iv.image = icon;
+                iv.contentMode = UIViewContentModeScaleAspectFit;
+                iv.layer.cornerRadius = 6.0;
+                iv.clipsToBounds = YES;
+                iv.userInteractionEnabled = NO;
+                [row addSubview:iv];
+                gx += iconW + spacing;
+            }
+            UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(gx, 0, tw, rowH)];
+            lab.text = nm;
+            lab.font = nf;
+            lab.textColor = [UIColor systemBlueColor];
+            lab.userInteractionEnabled = NO;
+            [row addSubview:lab];
+
+            [card addSubview:row];
+
+            if (i + 1 < cands.count) {
+                UIView *line = [[UIView alloc] initWithFrame:CGRectMake(0, y + rowH - 0.5, cardW, 0.5)];
+                line.backgroundColor = [UIColor separatorColor];
+                [card addSubview:line];
+            }
+        }
+
+        [container addSubview:card];
+
+        UIButton *cancelBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+        cancelBtn.frame = CGRectMake(8.0, CGRectGetMaxY(card.frame) + gap, cardW, cancelH);
+        [cancelBtn setTitle:@"取消" forState:UIControlStateNormal];
+        cancelBtn.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+        [cancelBtn setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
+        cancelBtn.backgroundColor = [UIColor secondarySystemBackgroundColor];
+        cancelBtn.layer.cornerRadius = 14.0;
+        [cancelBtn addTarget:target action:@selector(onCancelTap:) forControlEvents:UIControlEventTouchUpInside];
+        [container addSubview:cancelBtn];
+
+        gWXSheetContainer = container;
+        [host addSubview:container];
+        [UIView animateWithDuration:0.20 animations:^{ container.alpha = 1.0; }];
+        ok = YES;
+        WXLOG(@"自绘底部菜单已显示，候选 %lu 个", (unsigned long)cands.count);
+    } @catch (NSException *e) {
+        WXLOG(@"自绘菜单异常 %@", e.reason);
+        ok = NO;
+    }
+    return ok;
+}
+
 static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDictionary *options, void (^completion)(BOOL)) {
     UIViewController *top = WXTopViewController();
     if (!top) { WXLOG(@"找不到顶层控制器，直接放行"); completion(YES); return; }
+
+    @try {
+        UIWindow *hostWin = top.view.window;
+        if (!hostWin) {
+            for (UIWindow *w in [[UIApplication sharedApplication] windows]) {
+                if (w.isKeyWindow) { hostWin = w; break; }
+            }
+        }
+        if (hostWin && WXShowSheet(hostWin, cands, ^(NSDictionary *cand) {
+                BOOL handled = NO;
+                NSString *scheme = cand[@"scheme"];
+                NSString *bid = cand[@"bid"];
+                if (bid.length) handled = WXOpenByBundleID(url, bid, nil);
+                if (!handled && scheme.length) handled = WXOpenByScheme(url, scheme, ^(BOOL ok) {
+                    if (!ok) WXLOG(@"scheme 方式打开失败：%@", scheme);
+                });
+                if (!handled) handled = WXRequestSpringBoardLaunch(url, cand[@"bid"]);
+                if (!handled) handled = WXOpenByBundleID(url, cand[@"bid"], nil);
+                if (!handled) {
+                    WXLOG(@"几种方式都失败，回退系统默认，目标=%@", cand[@"bid"]);
+                    WXOpenPassthrough(url, options, completion);
+                } else if (completion) {
+                    completion(YES);
+                }
+            }, ^{
+                if (completion) completion(NO);
+            })) {
+            return;
+        }
+    } @catch (NSException *e) {
+        WXLOG(@"自绘菜单调用异常 %@", e.reason);
+    }
 
     NSString *msg = cands.count ? @"选择要跳转的微信"
                                 : @"没识别到微信 App";
@@ -1097,6 +1294,28 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                     return ao ? NSOrderedAscending : NSOrderedDescending;
                 }];
             }
+            if (gWXHostVC.view && WXShowSheet(gWXHostVC.view, snapshot, ^(NSDictionary *cand) {
+                    NSString *bid = cand[@"bid"];
+                    WXLOG(@"用户选择(自绘)：%@ (%@)", cand[@"name"], bid);
+                    gWXDialoging = NO;
+                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 25.0;
+                    WXSBHideOverlay();
+                    NSURL *u2 = url;
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                        WXLOG(@"后台线程开始拉起 %@", bid);
+                        WXSBLaunchByBundle(u2, bid);
+                    });
+                }, ^{
+                    WXLOG(@"用户取消(自绘)");
+                    gWXDialoging = NO;
+                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 25.0;
+                    WXSBHideOverlay();
+                })) {
+                WXSetGuard(NO);
+                WXLOG(@"自绘菜单已呈现");
+                return;
+            }
+
             for (NSDictionary *cand in snapshot) {
                 NSString *bid = cand[@"bid"];
                 NSString *nm = cand[@"name"] ?: bid;
