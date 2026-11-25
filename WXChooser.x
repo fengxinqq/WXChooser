@@ -43,6 +43,8 @@ static NSString *WXRealNameForBid(NSString *bid);
 static NSString *WXNameFromAppPath(NSString *dir);
 static UIViewController *gWXHostVC = nil;
 static void WXSBHideOverlay(void);
+static void WXPostSheetDismiss(void);
+static void WXRemoveSheetNow(void);
 static BOOL WXSBEnsureOverlay(void);
 
 static NSString *WXSelfBundleID(void) {
@@ -719,6 +721,7 @@ static WXSheetRowTarget *gWXSheetTarget = nil;
     gWXSheetCancel = nil;
     gWXSheetCands = nil;
     [self dismissSheet];
+    WXPostSheetDismiss();
     if (cands && idx >= 0 && idx < (NSInteger)cands.count && pick) pick(cands[idx]);
 }
 - (void)onCancelTap:(UIButton *)sender {
@@ -727,6 +730,7 @@ static WXSheetRowTarget *gWXSheetTarget = nil;
     gWXSheetCancel = nil;
     gWXSheetCands = nil;
     [self dismissSheet];
+    WXPostSheetDismiss();
     if (cancel) cancel();
 }
 @end
@@ -850,6 +854,28 @@ static BOOL WXShowSheet(UIView *host, NSArray<NSDictionary *> *cands, void (^pic
         ok = NO;
     }
     return ok;
+}
+
+static void WXPostSheetDismiss(void) {
+    @try {
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                             CFSTR("com.fengxin.wxchooser.sheetdismiss"), NULL, NULL, true);
+    } @catch (NSException *e) { }
+}
+
+static void WXRemoveSheetNow(void) {
+    UIView *c = gWXSheetContainer;
+    gWXSheetContainer = nil;
+    gWXSheetCands = nil;
+    gWXSheetPick = nil;
+    gWXSheetCancel = nil;
+    if (c) [c removeFromSuperview];
+}
+
+static void WXSheetDismissCallback(CFNotificationCenterRef center, void *observer, CFNotificationName name, const void *object, CFDictionaryRef info) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        WXRemoveSheetNow();
+    });
 }
 
 static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDictionary *options, void (^completion)(BOOL)) {
@@ -1240,6 +1266,7 @@ static BOOL WXReplayInner(void) {
 
 static void WXSBHideOverlay(void) {
     @try {
+        WXRemoveSheetNow();
         if (gWXHostVC && gWXHostVC.presentedViewController) {
             [gWXHostVC dismissViewControllerAnimated:NO completion:nil];
         }
@@ -1724,6 +1751,9 @@ static void WXInstallRouterHooks(void) {
 __attribute__((constructor)) static void WXInit(void) {
     WXLOG(@"LOADED in %@ (%@)", WXSelfBundleID(), WXIsSelfWeChat() ? @"微信本体" : @"其他进程");
     WXInstallHooks();
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                    WXSheetDismissCallback, CFSTR("com.fengxin.wxchooser.sheetdismiss"),
+                                    NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     if ([WXSelfBundleID() isEqualToString:@"com.apple.springboard"]) {
         if ([[NSFileManager defaultManager] fileExistsAtPath:kWXGuard]) {
             NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:kWXGuard error:nil];
