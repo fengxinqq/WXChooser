@@ -44,6 +44,8 @@ static NSString *WXNameFromAppPath(NSString *dir);
 static UIViewController *gWXHostVC = nil;
 static void WXSBHideOverlay(void);
 static void WXPostSheetDismiss(void);
+static double WXAppSheetAge(void);
+static void WXMarkAppSheetShowing(void);
 static void WXRemoveSheetNow(void);
 static BOOL WXSBEnsureOverlay(void);
 
@@ -878,6 +880,21 @@ static void WXSheetDismissCallback(CFNotificationCenterRef center, void *observe
     });
 }
 
+static void WXMarkAppSheetShowing(void) {
+    @try {
+        [[NSData dataWithBytes:"1" length:1] writeToFile:@"/var/mobile/wxchooser.appsheet" atomically:YES];
+    } @catch (NSException *e) { }
+}
+
+static double WXAppSheetAge(void) {
+    @try {
+        NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:@"/var/mobile/wxchooser.appsheet" error:nil];
+        NSDate *m = a[NSFileModificationDate];
+        if (!m) return 9999.0;
+        return [[NSDate date] timeIntervalSinceDate:m];
+    } @catch (NSException *e) { return 9999.0; }
+}
+
 static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDictionary *options, void (^completion)(BOOL)) {
     UIViewController *top = WXTopViewController();
     if (!top) { WXLOG(@"找不到顶层控制器，直接放行"); completion(YES); return; }
@@ -889,7 +906,7 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
                 if (w.isKeyWindow) { hostWin = w; break; }
             }
         }
-        if (hostWin && WXShowSheet(hostWin, cands, ^(NSDictionary *cand) {
+        BOOL shown = hostWin ? WXShowSheet(hostWin, cands, ^(NSDictionary *cand) {
                 BOOL handled = NO;
                 NSString *scheme = cand[@"scheme"];
                 NSString *bid = cand[@"bid"];
@@ -907,7 +924,10 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
                 }
             }, ^{
                 if (completion) completion(NO);
-            })) {
+            }) : NO;
+        if (shown) {
+            WXMarkAppSheetShowing();
+            WXLOG(@"应用内自绘菜单已显示，已标记占位（SB 不再弹）");
             return;
         }
     } @catch (NSException *e) {
@@ -1641,7 +1661,10 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
                 static CFAbsoluteTime lastHit = 0;
                 CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
                 BOOL tooSoon = (now - lastHit < 1.2);
-                BOOL busyByDialog = (gWXDialoging || now < gWXCooldownUntil);
+                double appAge = WXAppSheetAge();
+                BOOL appHandled = (appAge < 3.0);
+                BOOL busyByDialog = (gWXDialoging || now < gWXCooldownUntil || appHandled);
+                if (appHandled) WXLOG(@"应用内已弹窗（%.1f 秒前），SB 不再重复弹框", appAge);
                 if (busyByDialog) {
                     WXLOG(@"弹框进行中/刚选完，静默拒绝重复请求 url=%@", u.absoluteString ?: @"(无)");
                     if ([request respondsToSelector:NSSelectorFromString(@"declineWithReason:")]) {
