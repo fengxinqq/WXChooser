@@ -33,8 +33,8 @@ static void WXWriteLog(NSString *line) {
 
 #import <CommonCrypto/CommonDigest.h>
 
-// 1.65 完整性锚点：构建时由 tools/pin_integrity.py 把这 64 位填成
-// 「将这 64 字节归零后整个 dylib 的 SHA-256」。被改动过就对不上。
+// 完整性锚点：构建时由 pin_integrity.py 把这 64 位填成
+// 「跳过这 64 字节、从加载命令之后算到签名区之前的 SHA-256」。被改动过就对不上。
 // 首次构建时这里是 64 个 0，此时一律按「校验失败」处理（功能不生效）。
 __attribute__((used)) static const char kWXIntegrityPin[] =
     "WXPIN1" "0000000000000000000000000000000000000000000000000000000000000000";
@@ -69,8 +69,10 @@ static BOOL WXSelfIntegrityOK(void) {
         NSMutableData *md = [data mutableCopy];
         unsigned char *bytes = (unsigned char *)md.mutableBytes;
         NSUInteger len = md.length;
-        // 只算到 __LINKEDIT（LC_CODE_SIGNATURE）为止：签名改写尾部不影响这份哈希
+        // 只算到 __LINKEDIT 的 fileoff 为止（找不到就用 LC_CODE_SIGNATURE 的 dataoff）：
+        // 签名重写只动这两处之后的部分，不影响这段哈希
         NSUInteger limit = len;
+        NSUInteger sigoff = 0;
         @try {
             uint32_t ncmds = *(uint32_t *)(bytes + 16);
             NSUInteger p = 32;
@@ -84,10 +86,15 @@ static BOOL WXSelfIntegrityOK(void) {
                         if (fo > 0 && fo <= len) { limit = (NSUInteger)fo; break; }
                     }
                 }
+                if (cmd == 0x1d && p + 16 <= len) {   // LC_CODE_SIGNATURE：兜底界
+                    uint32_t off2 = *(uint32_t *)(bytes + p + 8);
+                    if (off2 > 32 && off2 <= len) sigoff = (NSUInteger)off2;
+                }
                 if (sz < 8) break;
                 p += sz;
             }
-        } @catch (NSException *e) { limit = len; }
+            if (limit == len && sigoff) limit = sigoff;
+        } @catch (NSException *e) { limit = sigoff ? sigoff : len; }
         if (limit == 0 || limit > len) limit = len;
 
         // 先按指针换算定位；不放心再按文件内容扫一遍（代码里另有一处 "WXPIN1" 字面量）
@@ -124,7 +131,7 @@ static BOOL WXSelfIntegrityOK(void) {
             WXLOG(@"★ 完整性校验：哈希范围异常，功能停用");
             return NO;
         }
-        memset(bytes + slot, 0, 64);
+        // 锚点那 64 字节整段跳过（不归零）：写锚点不会改变哈希，两侧实现天然一致
         NSString *expect = [[NSString stringWithUTF8String:pinned] lowercaseString];
         unsigned char dg[CC_SHA256_DIGEST_LENGTH];
         NSUInteger ranges[4][2] = { {hdr, limit}, {0, limit}, {hdr, len}, {0, len} };
@@ -137,7 +144,15 @@ static BOOL WXSelfIntegrityOK(void) {
                 if (ranges[j][0] == a && ranges[j][1] == b) { dup = YES; break; }
             }
             if (dup) continue;
-            CC_SHA256(bytes + a, (CC_LONG)(b - a), dg);
+            CC_SHA256_CTX ctx;
+            CC_SHA256_Init(&ctx);
+            if (slot >= a && slot + 64 <= b) {
+                CC_SHA256_Update(&ctx, bytes + a, (CC_LONG)(slot - a));
+                CC_SHA256_Update(&ctx, bytes + slot + 64, (CC_LONG)(b - slot - 64));
+            } else {
+                CC_SHA256_Update(&ctx, bytes + a, (CC_LONG)(b - a));
+            }
+            CC_SHA256_Final(dg, &ctx);
             NSMutableString *h2 = [NSMutableString stringWithCapacity:64];
             for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) [h2 appendFormat:@"%02x", dg[i]];
             hex = h2;
@@ -148,10 +163,9 @@ static BOOL WXSelfIntegrityOK(void) {
             }
         }
         if (gWXPinOK) WXLOG(@"完整性校验通过（%lu 字节）", (unsigned long)limit);
-        else WXLOG(@"☆ 完整性校验不一致（本版先放行，只为采集证据；期望 %@ 实得 %@ 文件 %s 长度 %lu 头 %lu 界 %lu 锚点 %lu base %p)",
+        else WXLOG(@"★ 完整性校验不一致：dylib 被改过，功能已停用（期望 %@ 实得 %@ 文件 %s 长度 %lu 头 %lu 界 %lu 锚点 %lu base %p)",
                    expect, hex, info.dli_fname, (unsigned long)len, (unsigned long)hdr,
                    (unsigned long)limit, (unsigned long)slot, info.dli_fbase);
-        if (!gWXPinOK) gWXPinOK = YES;   // 1.69 诊断版：先放行，不让校验挡住功能
     } @catch (NSException *e) {
         WXLOG(@"★ 完整性校验异常 %@，功能停用", e.reason);
         gWXPinOK = NO;

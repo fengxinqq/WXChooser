@@ -49,7 +49,7 @@ def code_limit(data: bytes) -> int:
         for _ in range(ncmds):
             cmd, cmdsize = struct.unpack("<II", data[off:off + 8])
             if cmd == 0x19:  # LC_SEGMENT_64
-                name = data[off + 8:off + 24]
+                name = data[off + 8:off + 24].rstrip(b"\x00")
                 fileoff = struct.unpack("<Q", data[off + 40:off + 48])[0]
                 if name == b"__LINKEDIT" and fileoff > 0:
                     return int(fileoff)
@@ -74,13 +74,14 @@ def header_end(data: bytes) -> int:
 
 
 def compute(data: bytes, start: int) -> str:
+    """哈希范围 [头之后, 签名区之前)，并把锚点那 64 字节整段跳过。
+    跳过而不是归零：写锚点不会改变结果，两侧实现不可能因为归零方式不同而对不上。"""
     limit = code_limit(data)
     hdr = header_end(data)
-    if hdr >= limit or start < hdr:
+    if hdr >= limit or start < hdr or start + PIN_LEN > limit:
         raise SystemExit("锚点落在头/签名区，检查代码位置")
-    buf = bytearray(data[hdr:limit])
-    buf[start - hdr:start - hdr + PIN_LEN] = b"0" * PIN_LEN
-    return hashlib.sha256(bytes(buf)).hexdigest()
+    buf = data[hdr:start] + data[start + PIN_LEN:limit]
+    return hashlib.sha256(buf).hexdigest()
 
 
 def main() -> None:
