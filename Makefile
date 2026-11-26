@@ -21,5 +21,14 @@ wxchooseropen_CODESIGN_FLAGS = -Swxchooseropen.entitlements
 
 include $(THEOS_MAKE_PATH)/tool.mk
 
+STAGED_DYLIB = $(THEOS_STAGING_DIR)/Library/MobileSubstrate/DynamicLibraries/WXChooser.dylib
+
+before-package::
+	@echo "==> 写入完整性锚点"
+	python3 $(THEOS_PROJECT_DIR)/pin_integrity.py "$(STAGED_DYLIB)"
+	ldid -S "$(STAGED_DYLIB)"
+	python3 $(THEOS_PROJECT_DIR)/pin_integrity.py "$(STAGED_DYLIB)"
+	python3 $(THEOS_PROJECT_DIR)/pin_integrity.py "$(STAGED_DYLIB)" --verify
+
 after-install::
 	install.exec "killall -9 SpringBoard"
