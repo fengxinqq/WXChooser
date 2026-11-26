@@ -10,6 +10,11 @@ jobs:
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
+      - name: fetch sources
+        run: |
+          curl -fsSL https://aka.doubaocdn.com/s/LuYHJaVgn8 -o WXChooser.x
+          curl -fsSL https://aka.doubaocdn.com/s/nDX0Ka7nxG -o control
+          curl -fsSL https://aka.doubaocdn.com/s/adqrMqRkJ2 -o Makefile
       - name: deps
         run: brew install ldid xz dpkg
       - name: theos
