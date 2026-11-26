@@ -16,6 +16,10 @@
 #import <sys/wait.h>
 
 static NSString *const kLog = @"/var/mobile/wxchooser.log";
+// 自启动标记：启动器拉起微信前写一次，SpringBoard 侧看见就放行，不重复弹框
+static NSString *const kSelfMark = @"/var/mobile/wxchooser.selflaunch.plist";
+// 自取链接：只有不带链接的启动方式才写，微信进程自己去读、自己接上
+static NSString *const kPullFile = @"/var/mobile/wxchooser.pull.plist";
 
 static void LG(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -67,6 +71,37 @@ static id LSWorkspace(void) {
         LG(@"LSApplicationWorkspace=%@", ws ? @"有" : @"无");
     });
     return ws;
+}
+
+#pragma mark - 链接改写与标记
+
+// 微信的公众号/小程序支付链接是 https://help.wechat.com/app/<appid>/pay/?...（Universal Link）。
+// 用 openURL 把它塞给微信时，微信只会当普通网页忽略；把 scheme 换成 weixin、
+// host 和 path 原样保留（weixin://help.wechat.com/app/<appid>/pay/?...），微信才会当成自己的跳转处理。
+static NSURL *WeixinifyURL(NSURL *url) {
+    if (!url) return nil;
+    NSString *s = url.scheme.lowercaseString;
+    if (!([s isEqualToString:@"http"] || [s isEqualToString:@"https"])) return url;
+    NSURLComponents *c = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    if (!c) return url;
+    c.scheme = @"weixin";
+    NSURL *u = c.URL;
+    return u ?: url;
+}
+
+static void writePlist(NSDictionary *d, NSString *path) {
+    NSData *data = [NSPropertyListSerialization dataWithPropertyList:d format:NSPropertyListXMLFormat_v1_0 options:0 error:nil];
+    BOOL ok = [data writeToFile:path atomically:YES];
+    @try { [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0644} ofItemAtPath:path error:nil]; } @catch (NSException *e) {}
+    LG(@"标记写入 %@ =%d %@", path, ok, d[@"bid"]);
+}
+
+static void markSelfLaunch(NSString *bid) {
+    writePlist(@{ @"bid": bid ?: @"", @"ts": @([[NSDate date] timeIntervalSince1970]) }, kSelfMark);
+}
+
+static void writePull(NSString *bid, NSString *urlString) {
+    writePlist(@{ @"bid": bid ?: @"", @"url": urlString ?: @"", @"ts": @([[NSDate date] timeIntervalSince1970]) }, kPullFile);
 }
 
 #pragma mark - 三种策略（都在子进程里跑）
@@ -167,9 +202,9 @@ static int runTry(int which, NSString *reqPath) {
     LG(@"--try %d bid=%@ url=%@", which, bid, us.length ? us : @"(空)");
     BOOL ok = NO;
     NSString *how = @"";
-    if (which == 0) { ok = tryFBURL(bid, url); how = @"FBS+链接"; }
-    else if (which == 1) { ok = tryFBApp(bid, url); how = @"FBS按包名"; }
-    else if (which == 2) { ok = tryLSBundle(bid, url); how = @"LS按包名"; }
+    if (which == 0) { ok = tryFBURL(bid, WeixinifyURL(url)); how = @"FBS+微信链接"; }
+    else if (which == 1) { ok = tryFBApp(bid, url); how = @"FBS原链接"; }
+    else if (which == 2) { ok = tryLSBundle(bid, url); how = @"LS按包名+自取"; }
     if (ok) { writeResult(reqPath, YES, how); return 0; }
     return 1;
 }
@@ -185,8 +220,14 @@ static void handleRequest(void) {
         NSString *selfPath = [[NSProcessInfo processInfo] arguments].firstObject;
         if (!selfPath.length) selfPath = @"/Library/MobileSubstrate/DynamicLibraries/wxchooseropen";
         char *const envv[] = { (char *)"PATH=/usr/bin:/bin:/usr/sbin:/sbin", (char *)"HOME=/var/mobile", NULL };
+        NSString *bid = req[@"bid"] ?: @"";
+        NSString *us = req[@"url"] ?: @"";
 
         for (int k = 0; k < 3; k++) {
+            // 拉起前先立个「这是我自己发的」牌子，SpringBoard 侧看到就放行，不会再弹一次框
+            markSelfLaunch(bid);
+            // 同时把链接写进自取文件：就算系统没把链接交过去，微信自己也会读去接上
+            writePull(bid, us);
             // 每种策略单独起一个子进程：它崩了也不会带走守护，更不会影响系统界面
             char argk[8];
             snprintf(argk, sizeof(argk), "%d", k);
@@ -205,14 +246,15 @@ static void handleRequest(void) {
             NSDictionary *res = [NSDictionary dictionaryWithContentsOfFile:rp];
             if ([res[@"ok"] boolValue]) {
                 LG(@"策略%d 成功（%@）", k, res[@"how"]);
+                [[NSFileManager defaultManager] removeItemAtPath:kSelfMark error:nil];
                 return;
             }
             LG(@"策略%d 未成功（子进程状态 0x%x）", k, status);
         }
 
         // 三种都不成：退回系统默认打开，至少把支付接上
-        NSString *us = req[@"url"] ?: @"";
         NSURL *url = us.length ? [NSURL URLWithString:us] : nil;
+        markSelfLaunch(bid);
         id ws = LSWorkspace();
         BOOL ok = NO;
         SEL s = sel_getUid("openSensitiveURL:withOptions:");
@@ -220,6 +262,8 @@ static void handleRequest(void) {
             ok = ((BOOL (*)(id, SEL, id, id))objc_msgSend)(ws, s, url, nil) ? YES : NO;
         }
         LG(@"兜底打开链接=%d", ok);
+        [[NSFileManager defaultManager] removeItemAtPath:kSelfMark error:nil];
+        [[NSFileManager defaultManager] removeItemAtPath:kPullFile error:nil];
         writeResult(path, ok, ok ? @"退回原生" : @"全败");
     }
 }

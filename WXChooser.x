@@ -482,29 +482,41 @@ static void WXToast(NSString *text) {
     });
 }
 
-// 交给启动器之后，2.5 秒看一次回执，失败就明确告诉用户，而不是一片死寂
+static void WXHandleResultDict(NSDictionary *res, NSString *bid) {
+    NSString *how = res[@"how"] ?: @"";
+    if ([how isEqualToString:@"退回原生"]) {
+        WXLOG(@"回执：只拉开了原生");
+        WXToast(@"分身没拉起来，已退回原生");
+        return;
+    }
+    if ([res[@"ok"] boolValue]) {
+        WXLOG(@"启动器回执 成功（%@）", how);
+    } else {
+        WXLOG(@"启动器回执 失败（%@）", how);
+        WXToast([NSString stringWithFormat:@"没打开（%@）", how.length ? how : @"全败"]);
+    }
+}
+
+// 交给启动器之后，先 2.5 秒看一次回执，还没有就再等 3 秒看第二次，别误报
 static void WXWatchLaunchResult(NSString *dir, NSString *bid) {
     if (!dir.length) return;
+    NSString *resPath = [dir stringByAppendingPathComponent:@"wxres.plist"];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        NSString *resPath = [dir stringByAppendingPathComponent:@"wxres.plist"];
         NSDictionary *res = [NSDictionary dictionaryWithContentsOfFile:resPath];
         if (![res isKindOfClass:[NSDictionary class]]) {
-            WXLOG(@"启动器无回执（%@）", bid);
-            WXToast(@"没打开：没收到回执");
+            WXLOG(@"2.5 秒还没回执（%@），再等 3 秒", bid);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                NSDictionary *r2 = [NSDictionary dictionaryWithContentsOfFile:resPath];
+                if (![r2 isKindOfClass:[NSDictionary class]]) {
+                    WXLOG(@"启动器无回执（%@）", bid);
+                    WXToast(@"没打开：没收到回执");
+                    return;
+                }
+                WXHandleResultDict(r2, bid);
+            });
             return;
         }
-        NSString *how = res[@"how"] ?: @"";
-        if ([how isEqualToString:@"退回原生"]) {
-            WXLOG(@"回执：只拉开了原生");
-            WXToast(@"分身没拉起来，已退回原生");
-            return;
-        }
-        if ([res[@"ok"] boolValue]) {
-            WXLOG(@"启动器回执 成功（%@）", how);
-        } else {
-            WXLOG(@"启动器回执 失败（%@）", res[@"how"]);
-            WXToast([NSString stringWithFormat:@"没打开（%@）", res[@"how"] ?: @"全败"]);
-        }
+        WXHandleResultDict(res, bid);
     });
 }
 
@@ -2080,7 +2092,48 @@ static NSString *WXWeixinURLFromString(NSString *s) {
     return out.length > 6 ? out : nil;
 }
 
+static NSString *kWXSelfMark = @"/var/mobile/wxchooser.selflaunch.plist";
+
+// 这次抬微信的事务，是不是常驻启动器自己发起的？是就放行，别再弹一次框、更别拒绝它
+static BOOL WXSelfLaunchPassThrough(id request) {
+    NSDictionary *m = [NSDictionary dictionaryWithContentsOfFile:kWXSelfMark];
+    if (![m isKindOfClass:[NSDictionary class]]) return NO;
+    NSString *bid = m[@"bid"];
+    double ts = [m[@"ts"] doubleValue];
+    if (!bid.length || ts <= 0) return NO;
+    double age = [[NSDate date] timeIntervalSince1970] - ts;
+    if (age < 0 || age > 10.0) {
+        [[NSFileManager defaultManager] removeItemAtPath:kWXSelfMark error:nil];
+        return NO;
+    }
+    NSString *reqBid = WXBundleFromRequest(request);
+    if (![reqBid isEqualToString:bid]) {
+        int b2 = 400;
+        NSString *sb2 = WXScanForBundleString(request, 0, &b2);
+        if (sb2) reqBid = sb2;
+    }
+    BOOL match = [reqBid isEqualToString:bid];
+    if (!match) {
+        NSString *desc = nil;
+        @try { desc = [request description]; } @catch (NSException *e) {}
+        match = (desc.length && [desc containsString:bid]);
+    }
+    if (!match) return NO;
+    [[NSFileManager defaultManager] removeItemAtPath:kWXSelfMark error:nil];
+    WXLOG(@"  自启动标记匹配（%.1fs 前，%@）", age, bid);
+    return YES;
+}
+
 static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long options, id validator) {
+    @try {
+        if (WXSelfLaunchPassThrough(request)) {
+            WXLOG(@"★ 放行本次自启动事务（启动器发起），不拦不弹");
+            if (o_sbmw_execute) o_sbmw_execute(self, _cmd, request, options, validator);
+            return;
+        }
+    } @catch (NSException *e) {
+        WXLOG(@"自启动判定异常 %@", e.reason);
+    }
     BOOL intercept = NO;
     BOOL shouldShow = NO;
     NSURL *hitURL = nil;
@@ -2238,6 +2291,94 @@ static void WXInstallRouterHooks(void) {
     }
 }
 
+#pragma mark - 微信进程内：链接自取（不依赖系统把链接传过来）
+
+static NSString *kWXPullFile = @"/var/mobile/wxchooser.pull.plist";
+
+static CGFloat WXPullAgeLimit(void) { return 40.0; }
+
+static NSURL *WXPullURLForSelf(BOOL consume) {
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kWXPullFile];
+    if (![d isKindOfClass:[NSDictionary class]]) return nil;
+    NSString *bid = d[@"bid"];
+    NSString *us = d[@"url"];
+    double ts = [d[@"ts"] doubleValue];
+    if (!us.length || ![bid isEqualToString:WXSelfBundleID()]) return nil;
+    double age = [[NSDate date] timeIntervalSince1970] - ts;
+    if (age < 0 || age > WXPullAgeLimit()) return nil;
+    if (consume) [[NSFileManager defaultManager] removeItemAtPath:kWXPullFile error:nil];
+    return [NSURL URLWithString:us];
+}
+
+// 给 scene:openURLContexts: 造个最小可用的壳，微信只读 URL 就够了
+@interface WXFakeURLOptions : NSObject
+@end
+@implementation WXFakeURLOptions
+- (id)sourceApplication { return nil; }
+- (id)annotation { return nil; }
+- (BOOL)openInPlace { return NO; }
+- (BOOL)_openInPlace { return NO; }
+- (id)eventAttribution { return nil; }
+- (NSString *)description { return @"<WXFakeURLOptions>"; }
+@end
+
+@interface WXFakeURLContext : NSObject
+@property (nonatomic, strong) NSURL *URL;
+@end
+@implementation WXFakeURLContext
+- (id)options { return [[WXFakeURLOptions alloc] init]; }
+- (NSString *)description { return [NSString stringWithFormat:@"<WXFakeURLContext %@>", self.URL]; }
+@end
+
+static BOOL gWXPullBusy = NO;
+
+static void WXPullDeliver(NSURL *url) {
+    if (!url || gWXPullBusy) return;
+    gWXPullBusy = YES;
+    WXLOG(@"微信侧自取链接：%@", url.absoluteString);
+    id app = [UIApplication sharedApplication];
+    id del = [app delegate];
+
+    // 1) 老接口：AppDelegate 的 application:openURL:options:
+    SEL s1 = NSSelectorFromString(@"application:openURL:options:");
+    if ([del respondsToSelector:s1]) {
+        WXLOG(@"自取：走 AppDelegate application:openURL:options:");
+        @try {
+            ((BOOL (*)(id, SEL, id, id, id))objc_msgSend)(del, s1, app, url, @{});
+            return;
+        } @catch (NSException *e) { WXLOG(@"自取 AppDelegate 异常 %@", e.reason); }
+    }
+
+    // 2) 场景接口：SceneDelegate 的 scene:openURLContexts:
+    SEL s2 = NSSelectorFromString(@"scene:openURLContexts:");
+    NSArray *scenes = [[app connectedScenes] allObjects];
+    for (id scene in scenes) {
+        id sd = nil;
+        @try { sd = ((id (*)(id, SEL))objc_msgSend)(scene, NSSelectorFromString(@"delegate")); } @catch (NSException *e) {}
+        if (!sd || ![sd respondsToSelector:s2]) continue;
+        WXLOG(@"自取：走 SceneDelegate scene:openURLContexts:");
+        @try {
+            WXFakeURLContext *ctx = [[WXFakeURLContext alloc] init];
+            ctx.URL = url;
+            NSSet *set = [NSSet setWithObject:ctx];
+            ((void (*)(id, SEL, id, id))objc_msgSend)(sd, s2, scene, set);
+            return;
+        } @catch (NSException *e) { WXLOG(@"自取 SceneDelegate 异常 %@", e.reason); }
+    }
+    WXLOG(@"自取：没有可用的入口（delegate=%@ 场景数=%lu）", del ? NSStringFromClass([del class]) : @"(无)", (unsigned long)scenes.count);
+}
+
+static void WXPullTick(void) {
+    NSURL *u = WXPullURLForSelf(YES);
+    if (!u) return;
+    // 稍等一下再送：万一系统自己已经把链接交过来了，让那条路先走完
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        WXPullDeliver(u);
+    });
+}
+
+#pragma mark - 初始化
+
 __attribute__((constructor)) static void WXInit(void) {
     gWXInSB = [WXSelfBundleID() isEqualToString:@"com.apple.springboard"];
     WXLOG(@"LOADED in %@ (%@)", WXSelfBundleID(), WXIsSelfWeChat() ? @"微信本体" : @"其他进程");
@@ -2331,6 +2472,18 @@ __attribute__((constructor)) static void WXInit(void) {
             gWXBusy = NO;
             gWXDialoging = NO;
         }];
+        if (WXIsSelfWeChat()) {
+            WXLOG(@"微信侧：挂上自取链接监听 %@", WXSelfBundleID());
+            [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                              object:nil
+                                                               queue:[NSOperationQueue mainQueue]
+                                                          usingBlock:^(NSNotification *n) {
+                WXPullTick();
+            }];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                WXPullTick();
+            });
+        }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             WXPostLoadedPing();
             WXLOG(@"已向 SB 报到：%@", WXSelfBundleID());
