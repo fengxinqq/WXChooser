@@ -511,25 +511,38 @@ static void WXHandleSBLaunchFromPasteboard(void) {
     NSURL *u = us.length ? [NSURL URLWithString:us] : nil;
     WXLOG(@"SB: 代为启动 bid=%@ url=%@", bid, us);
     WXLoadSBS();
-    int r = -1;
+    int r1 = -1, r2 = -1, r3 = -1;
+    BOOL helperOk = NO;
     @try {
         if (gSBSLaunchWithURL && u) {
             CFStringRef eb = NULL;
-            r = gSBSLaunchWithURL((__bridge CFStringRef)bid, (__bridge CFURLRef)u,
-                                  (__bridge CFDictionaryRef)@{}, &eb, false);
-            WXLOG(@"SB: SBS带链接 r=%d err=%@", r, eb ? (__bridge NSString *)eb : @"无");
+            r1 = gSBSLaunchWithURL((__bridge CFStringRef)bid, (__bridge CFURLRef)u, NULL, &eb, false);
+            WXLOG(@"SB: SBS带链接(空options) r=%d err=%@", r1, eb ? (__bridge NSString *)eb : @"无");
             if (eb) CFRelease(eb);
         }
-        if (r != 0 && gSBSLaunch) {
-            r = gSBSLaunch((__bridge CFStringRef)bid, false);
-            WXLOG(@"SB: SBS只启动 r=%d", r);
+    } @catch (NSException *e) { WXLOG(@"SB: SBS带链接异常 %@", e.reason); }
+    @try {
+        if (r1 != 0 && gSBSLaunchWithURL && u) {
+            CFStringRef eb2 = NULL;
+            r2 = gSBSLaunchWithURL((__bridge CFStringRef)bid, (__bridge CFURLRef)u,
+                                   (__bridge CFDictionaryRef)@{}, &eb2, false);
+            WXLOG(@"SB: SBS带链接(空字典) r=%d err=%@", r2, eb2 ? (__bridge NSString *)eb2 : @"无");
+            if (eb2) CFRelease(eb2);
         }
-    } @catch (NSException *e) { WXLOG(@"SB: 代为启动异常 %@", e.reason); }
-    if (r != 0) {
-        BOOL helperOk = NO;
+        if (r1 != 0 && r2 != 0 && gSBSLaunch) {
+            r3 = gSBSLaunch((__bridge CFStringRef)bid, false);
+            WXLOG(@"SB: SBS只启动 r=%d", r3);
+        }
+    } @catch (NSException *e) { WXLOG(@"SB: SBS仅启动异常 %@", e.reason); }
+    if (r1 != 0 && r2 != 0 && r3 != 0) {
         @try { helperOk = WXSBLaunchByBundle(u, bid); } @catch (NSException *e) { WXLOG(@"SB: 外部启动器异常 %@", e.reason); }
-        WXLOG(@"SB: SBS 失败，外部启动器结果=%d", helperOk);
+        WXLOG(@"SB: 外部启动器结果=%d", helperOk);
     }
+    @try {
+        UIPasteboard *pb = [UIPasteboard generalPasteboard];
+        pb.string = [NSString stringWithFormat:@"WXRES\x01sbs=%d\x01sbs2=%d\x01plain=%d\x01helper=%d",
+                     r1, r2, r3, helperOk ? 1 : 0];
+    } @catch (NSException *e) { }
 }
 
 static void WXSBCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
@@ -1207,7 +1220,14 @@ static void WXLaunchChosen(NSURL *url, NSDictionary *cand, NSDictionary *options
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
-        WXShowDiagHUD([NSString stringWithFormat:@"SB 没把 %@ 拉起来（交棒=%d）", bid ?: @"?", posted]);
+        NSString *back = nil;
+        @try { back = [UIPasteboard generalPasteboard].string; } @catch (NSException *e) { }
+        if ([back hasPrefix:@"WXRES\x01"]) {
+            NSString *txt = [[back componentsSeparatedByString:@"\x01"] componentsJoinedByString:@" "];
+            WXShowDiagHUD([NSString stringWithFormat:@"SB 回执：%@", txt]);
+        } else {
+            WXShowDiagHUD([NSString stringWithFormat:@"SB 没回执（交棒=%d，剪贴板=%@）", posted, back.length ? @"有内容" : @"空"]);
+        }
     });
     if (completion) completion(YES);
 }
