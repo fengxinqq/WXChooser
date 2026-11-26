@@ -4,7 +4,6 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <unistd.h>
-#import <sys/stat.h>
 #import <stdarg.h>
 #import <dispatch/dispatch.h>
 
@@ -27,6 +26,16 @@ static id WSObj(void) {
     Class c = NSClassFromString(@"LSApplicationWorkspace");
     if (!c) return nil;
     return ((id (*)(id, SEL))objc_msgSend)(c, sel_getUid("defaultWorkspace"));
+}
+
+static void markSelfLaunch(NSString *bid) {
+    NSDictionary *d = @{ @"bid": bid ?: @"",
+                         @"ts": [NSNumber numberWithDouble:[[NSDate date] timeIntervalSince1970]] };
+    [d writeToFile:@"/var/mobile/wxchooser.selflaunch.plist" atomically:YES];
+}
+
+static void clearSelfLaunch(void) {
+    [[NSFileManager defaultManager] removeItemAtPath:@"/var/mobile/wxchooser.selflaunch.plist" error:nil];
 }
 
 static id FBSvc(void) {
@@ -92,16 +101,6 @@ static BOOL openViaFBSSystem(NSString *bid, NSURL *url) {
     return NO;
 }
 
-static NSString *const kSelfMark = @"/var/mobile/wxchooser.selflaunch.plist";
-
-// 立牌：告诉 SpringBoard「接下来这次启动是我们自己发的」，别拦、别弹
-static void markSelfLaunch(NSString *bid) {
-    NSDictionary *d = @{ @"bid": bid ?: @"", @"ts": @([[NSDate date] timeIntervalSince1970]) };
-    [d writeToFile:kSelfMark atomically:YES];
-    chmod([kSelfMark UTF8String], 0644);
-    LG(@"立自启动标记 bid=%@", bid);
-}
-
 int main(int argc, char **argv) {
     __block NSInteger r = -999;
     __block NSString *how = @"无";
@@ -121,8 +120,9 @@ int main(int argc, char **argv) {
 
         id ws = WSObj();
         LG(@"工作区=%@ FBS=%@", ws ? NSStringFromClass([ws class]) : @"(空)", FBSvc() ? @"有" : @"无");
-
         markSelfLaunch(bid);
+        LG(@"已写自启动标记 bid=%@", bid);
+
         BOOL useURLFirst = (url != nil);
 
         if (useURLFirst) {
@@ -165,6 +165,7 @@ int main(int argc, char **argv) {
 
         LG(@"最终 how=%@ r=%ld", how, (long)r);
         [[NSFileManager defaultManager] removeItemAtPath:cmdPath error:nil];
+        if (r == 0) clearSelfLaunch();   // 成功了就撤掉自启动标记，别吞掉用户下一次请求
     }
     return (r == 0) ? 0 : 1;
 }
