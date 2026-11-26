@@ -259,6 +259,17 @@ int main(int argc, char **argv) {
             WXHandleOneshot();
             return 0;
         }
+        // 只允许一个常驻实例（launchd 起一个、SpringBoard 兜底起一个时会互相顶掉）
+        NSString *pidPath = @"/var/mobile/wxchooser.daemon.pid";
+        NSString *oldPid = [NSString stringWithContentsOfFile:pidPath encoding:NSUTF8StringEncoding error:nil];
+        if (oldPid.length) {
+            pid_t op = (pid_t)oldPid.intValue;
+            if (op > 1 && op != getpid() && kill(op, 0) == 0) {
+                LG(@"已有常驻实例 pid=%d，本次退出", (int)op);
+                return 0;
+            }
+        }
+        [[NSString stringWithFormat:@"%d", getpid()] writeToFile:pidPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
         LG(@"守护常驻启动 pid=%d", getpid());
         int token = 0;
         notify_register_dispatch("com.fengxin.wxchooser.launchreq", &token,

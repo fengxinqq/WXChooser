@@ -1613,6 +1613,24 @@ static void WXLSAsyncOpen(NSString *bid, NSURL *url) {
     } @catch (NSException *e) { WXLOG(@"LS 异步拉起异常 %@", e.reason); }
 }
 
+// SpringBoard 顺手拉起常驻启动器（不带参数 = 守护模式）；launchd 已经起过就算了
+static void WXSpawnOpenerDaemon(void) {
+    @try {
+        NSString *bin = WXOpenerPath();
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (!bin.length || ![fm isExecutableFileAtPath:bin]) {
+            WXLOG(@"常驻启动器不可执行：%@", bin ?: @"(空)");
+            return;
+        }
+        const char *path = bin.UTF8String;
+        char *const argsv[] = { (char *)path, NULL };
+        char *const envv[] = { (char *)"PATH=/usr/bin:/bin:/usr/sbin:/sbin", (char *)"HOME=/var/mobile", NULL };
+        pid_t pid = 0;
+        int rc = posix_spawn(&pid, path, NULL, NULL, argsv, envv);
+        WXLOG(@"拉起常驻启动器 %@ rc=%d errno=%d pid=%d", bin, rc, errno, (int)pid);
+    } @catch (NSException *e) { WXLOG(@"拉常驻启动器异常 %@", e.reason); }
+}
+
 static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
     @try {
         if (!bid.length) return NO;
@@ -1641,7 +1659,8 @@ static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
         WXLOG(@"命令文件 %@ 已写=%d", cmdPath, wrote);
 
         const char *path = bin.UTF8String;
-        char *const argsv[] = { (char *)path, NULL };
+        // --oneshot：只干一次活就退出；常驻模式不带参数，由单独的守护启动
+        char *const argsv[] = { (char *)path, (char *)"--oneshot", NULL };
         char *const envv[] = { (char *)"PATH=/usr/bin:/bin:/usr/sbin:/sbin", (char *)"HOME=/var/mobile", NULL };
         pid_t pid = 0;
         int rc = posix_spawn(&pid, path, NULL, NULL, argsv, envv);
@@ -2245,6 +2264,9 @@ __attribute__((constructor)) static void WXInit(void) {
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         WXLoadSBS();
         WXLOG(@"SB: 已注册代办启动监听 + 报到监听");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            WXSpawnOpenerDaemon();
+        });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             WXInstallRouterHooks();
             WXInstallWorkspaceHook();
