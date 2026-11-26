@@ -1037,64 +1037,105 @@ static void WXShowDiagHUD(NSString *text) {
     } @catch (NSException *e) { WXLOG(@"HUD 异常 %@", e.reason); }
 }
 
-static void WXLaunchChosen(NSURL *url, NSDictionary *cand, NSDictionary *options, void (^completion)(BOOL)) {
-    NSString *bid = cand[@"bid"];
-    NSString *scheme = cand[@"scheme"];
-    BOOL isWebURL = !WXIsWeixinScheme(url.scheme ?: @"");
-    NSMutableString *steps = [NSMutableString string];
-    WXPostLaunchingNote();
+@interface WXLaunchRunner : NSObject
+@property (nonatomic, strong) NSURL *url;
+@property (nonatomic, copy) NSDictionary *cand;
+@property (nonatomic, copy) NSDictionary *options;
+@property (nonatomic, copy) void (^completion)(BOOL);
+@property (nonatomic, strong) NSMutableString *steps;
+@property (nonatomic, assign) NSInteger step;
+@property (nonatomic, assign) BOOL done;
+- (void)start;
+@end
 
-    __block BOOL done = NO;
-    __block NSInteger step = 0;
-    __block void (^runNext)(void);
-    __weak void (^weakNext)(void);
+static WXLaunchRunner *gWXRunner = nil;
 
-    void (^finish)(BOOL) = ^(BOOL ok) {
-        if (done) return;
-        done = YES;
-        WXLOG(@"选择结果 target=%@ url=%@ ok=%d\n%@", bid ?: @"(空)", url.absoluteString ?: @"(空)", ok, steps);
-        if (ok) { gWXBusy = NO; gWXBusyAt = 0; }
-        if (completion) completion(YES);
-        if (!ok) {
-            WXShowDiagHUD([NSString stringWithFormat:@"没跳转 (%@)\n%@", bid ?: @"?", steps]);
-        }
-    };
+@implementation WXLaunchRunner
 
-    runNext = ^{
-        if (done) return;
-        BOOL fired = NO;
-        NSString *label = nil;
-        switch (step) {
-            case 0: label = @"1 包名+链接"; fired = bid.length ? WXOpenByBundleID(url, bid, nil) : NO; break;
-            case 1: label = @"2 系统SBS+链接"; fired = bid.length ? WXLaunchBySBS(url, bid) : NO; break;
-            case 2: label = @"3 仅启动App"; fired = bid.length ? WXLaunchBySBS(nil, bid) : NO; break;
-            case 3:
-                if (isWebURL) { step++; if (weakNext) weakNext(); return; }
-                label = @"4 改链接"; fired = scheme.length ? WXOpenByScheme(url, scheme, nil) : NO;
-                break;
-            case 4: label = @"5 系统默认"; fired = YES; WXOpenPassthrough(url, options, nil); break;
-            default: finish(NO); return;
-        }
-        step++;
-        [steps appendFormat:@"%@ 返回%d\n", label, fired];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (done) return;
-            if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
-                [steps appendString:@"→ 已离开当前应用"];
-                finish(YES);
-                return;
-            }
-            if (weakNext) weakNext();
-        });
-    };
-
-    runNext = [runNext copy];
-    weakNext = runNext;
-    runNext();
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        finish(NO);
+- (void)start {
+    self.steps = [NSMutableString string];
+    self.step = 0;
+    self.done = NO;
+    gWXRunner = self;
+    [self next];
+    __weak WXLaunchRunner *ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [ws finish:NO];
     });
+}
+
+- (void)next {
+    if (self.done) return;
+    NSString *bid = self.cand[@"bid"];
+    NSString *scheme = self.cand[@"scheme"];
+    BOOL isWeb = !WXIsWeixinScheme(self.url.scheme ?: @"");
+    BOOL fired = NO;
+    NSString *label = nil;
+    switch (self.step) {
+        case 0:
+            label = @"1 包名+链接";
+            fired = bid.length ? WXOpenByBundleID(self.url, bid, nil) : NO;
+            break;
+        case 1:
+            label = @"2 系统SBS+链接";
+            fired = bid.length ? WXLaunchBySBS(self.url, bid) : NO;
+            break;
+        case 2:
+            label = @"3 仅启动App";
+            fired = bid.length ? WXLaunchBySBS(nil, bid) : NO;
+            break;
+        case 3:
+            if (isWeb) { self.step++; [self next]; return; }
+            label = @"4 改链接";
+            fired = scheme.length ? WXOpenByScheme(self.url, scheme, nil) : NO;
+            break;
+        case 4:
+            label = @"5 系统默认";
+            fired = YES;
+            WXOpenPassthrough(self.url, self.options, nil);
+            break;
+        default:
+            [self finish:NO];
+            return;
+    }
+    self.step++;
+    [self.steps appendFormat:@"%@ 返回%d\n", label, fired];
+    WXLOG(@"启动第%d步 %@ 返回%d", (int)self.step, label, fired);
+    __weak WXLaunchRunner *ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        WXLaunchRunner *me = ws;
+        if (!me || me.done) return;
+        if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
+            [me.steps appendString:@"→ 已离开当前应用"];
+            [me finish:YES];
+            return;
+        }
+        [me next];
+    });
+}
+
+- (void)finish:(BOOL)ok {
+    if (self.done) return;
+    self.done = YES;
+    NSString *bid = self.cand[@"bid"];
+    WXLOG(@"选择结果 target=%@ url=%@ ok=%d\n%@", bid ?: @"(空)", self.url.absoluteString ?: @"(空)", ok, self.steps);
+    if (ok) { gWXBusy = NO; gWXBusyAt = 0; }
+    if (self.completion) self.completion(YES);
+    if (!ok) {
+        WXShowDiagHUD([NSString stringWithFormat:@"没跳转 → %@\n%@", bid ?: @"(无包名)", self.steps]);
+    }
+}
+
+@end
+
+static void WXLaunchChosen(NSURL *url, NSDictionary *cand, NSDictionary *options, void (^completion)(BOOL)) {
+    WXPostLaunchingNote();
+    WXLaunchRunner *r = [[WXLaunchRunner alloc] init];
+    r.url = url;
+    r.cand = cand;
+    r.options = options;
+    r.completion = completion;
+    [r start];
 }
 
 static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDictionary *options, void (^completion)(BOOL)) {
