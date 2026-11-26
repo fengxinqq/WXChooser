@@ -49,6 +49,7 @@ static double WXAppSheetAge(void);
 static void WXMarkAppSheetShowing(void);
 static void WXRemoveSheetNow(void);
 static BOOL WXSBEnsureOverlay(void);
+static BOOL WXSBInterceptURL(NSURL *url, NSString *entry);
 
 static NSString *WXSelfBundleID(void) {
     static NSString *bid = nil;
@@ -1009,7 +1010,10 @@ static BOOL WXTryIntercept(NSURL *url, NSDictionary *options, void (^completion)
     NSString *selfBid = WXSelfBundleID();
     BOOL inSpringBoard = [selfBid isEqualToString:@"com.apple.springboard"];
     WXLOG(@"[%@] 入口调用 App=%@ url=%@ opts=%@", entry, selfBid ?: @"(未知)", url.absoluteString ?: @"(无)", options ? [(NSDictionary *)options description] : @"(空)");
-    if (inSpringBoard) return NO;   // SpringBoard 走 SBMainWorkspace 那一层
+    if (inSpringBoard) {
+        // 微信已在运行时，跳转不再产生启动事务，只走 SB 的 URL 路由；这条以前被我们直接放行了
+        return WXSBInterceptURL(url, entry);
+    }
     @try {
         if (!url) return NO;
         NSString *scheme = url.scheme ?: @"";
@@ -1435,6 +1439,21 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
             if (fallback) fallback();
         }
     });
+}
+
+// SpringBoard 里的 URL 路由：微信热激活（已运行时）也走这里，必须在这里也弹
+static BOOL WXSBInterceptURL(NSURL *url, NSString *entry) {
+    if (![url isKindOfClass:[NSURL class]]) return NO;
+    if (!WXIsTargetURL(url)) return NO;
+    if (WXIsSelfWeChat()) return NO;
+    if (gWXOverlayVisible || gWXDialoging) { WXLOG(@"SB 路由重复命中（弹框已在），拦下不重复：%@", url.absoluteString); return YES; }
+    if (CFAbsoluteTimeGetCurrent() < gWXSuppressUntil) { WXLOG(@"SB 路由命中但处于自启动放行窗口，放行：%@", url.absoluteString); return NO; }
+    if (gWXGuardTripped) { WXLOG(@"SB 路由命中但护栏生效，放行"); return NO; }
+    WXLOG(@"★ SB 路由拦到微信：%@ （入口 %@）", url.absoluteString, entry);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        WXSBShowChooser(url, entry, nil);
+    });
+    return YES;
 }
 
 static BOOL h_router_openURL(id self, SEL _cmd, NSURL *url) {
