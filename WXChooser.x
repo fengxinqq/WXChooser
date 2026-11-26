@@ -31,7 +31,7 @@ static void WXWriteLog(NSString *line) {
 
 #define WXLOG(...) WXWriteLog([NSString stringWithFormat:__VA_ARGS__])
 
-static void (*o_sbmw_execute)(id, SEL, id, unsigned long long, id) = NULL;
+static void (*o_sbmw_execute)(__unsafe_unretained id, SEL, __unsafe_unretained id, unsigned long long, __unsafe_unretained id) = NULL;
 
 static volatile BOOL gWXBusy = NO;
 static volatile CFAbsoluteTime gWXBusyAt = 0;
@@ -1200,9 +1200,9 @@ static volatile CFAbsoluteTime gWXOverlaySince = 0;
 static NSString *const kWXGuard = @"/var/mobile/wxchooser.guard";
 static BOOL gWXGuardTripped = NO;
 static CFAbsoluteTime gWXSuppressUntil = 0;
-static id gWXPendingReq = nil;
-static id gWXPendingSelf = nil;
-static id gWXPendingValidator = nil;
+static __unsafe_unretained id gWXPendingReq = nil;
+static __unsafe_unretained id gWXPendingSelf = nil;
+static __unsafe_unretained id gWXPendingValidator = nil;
 static unsigned long long gWXPendingOpts = 0;
 static SEL gWXPendingCmd = NULL;
 static BOOL WXReplayPending(void);
@@ -1469,7 +1469,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
     });
 }
 
-static BOOL h_router_openURL(id self, SEL _cmd, NSURL *url) {
+static BOOL h_router_openURL(__unsafe_unretained id self, SEL _cmd, __unsafe_unretained NSURL *url) {
     @try {
         WXLOG(@"[HFOpenURLRouter openURL:] %@", url.absoluteString);
         if (WXSelfLaunchAge() < 8.0) {
@@ -1487,7 +1487,7 @@ static BOOL h_router_openURL(id self, SEL _cmd, NSURL *url) {
     return o_router_openURL ? o_router_openURL(self, _cmd, url) : NO;
 }
 
-static BOOL h_router_openSensitive(id self, SEL _cmd, NSURL *url) {
+static BOOL h_router_openSensitive(__unsafe_unretained id self, SEL _cmd, __unsafe_unretained NSURL *url) {
     @try {
         WXLOG(@"[HFOpenURLRouter openSensitiveURL:] %@", url.absoluteString);
         if (WXSelfLaunchAge() < 8.0) {
@@ -1678,7 +1678,7 @@ static NSString *WXWeixinURLFromString(NSString *s) {
     return out.length > 6 ? out : nil;
 }
 
-static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long options, id validator) {
+static void h_sbmw_execute(__unsafe_unretained id self, SEL _cmd, __unsafe_unretained id request, unsigned long long options, __unsafe_unretained id validator) {
     CFAbsoluteTime nowWX = CFAbsoluteTimeGetCurrent();
     if (gWXOverlayVisible && gWXOverlaySince > 0 && nowWX - gWXOverlaySince > 12.0) {
         WXLOG(@"上次弹框挂了 %.0f 秒没关，先清掉", nowWX - gWXOverlaySince);
@@ -1821,7 +1821,7 @@ static void WXInstallWorkspaceHook(void) {
     NSString *selName = @"_executeTransitionRequest:options:validator:";
     Method m = class_getInstanceMethod(ws, NSSelectorFromString(selName));
     if (!m) { WXLOG(@"挂钩跳过：SBMainWorkspace %@ 不存在", selName); return; }
-    o_sbmw_execute = (void (*)(id, SEL, id, unsigned long long, id))method_getImplementation(m);
+    o_sbmw_execute = (void (*)(__unsafe_unretained id, SEL, __unsafe_unretained id, unsigned long long, __unsafe_unretained id))method_getImplementation(m);
     method_setImplementation(m, (IMP)h_sbmw_execute);
     WXLOG(@"挂钩成功：SBMainWorkspace _executeTransitionRequest:options:validator:");
 }
@@ -1835,7 +1835,7 @@ static void WXInstallRouterHooks(void) {
     SEL s1 = NSSelectorFromString(@"openURL:");
     Method m1 = class_getInstanceMethod(router, s1);
     if (m1 && method_getNumberOfArguments(m1) == 3) {
-        o_router_openURL = (BOOL (*)(id, SEL, NSURL *))method_setImplementation(m1, (IMP)h_router_openURL);
+        o_router_openURL = (BOOL (*)(__unsafe_unretained id, SEL, __unsafe_unretained NSURL *))method_setImplementation(m1, (IMP)h_router_openURL);
         WXLOG(@"挂钩成功：HFOpenURLRouter openURL:");
     } else {
         WXLOG(@"挂钩跳过：HFOpenURLRouter openURL: 参数数不符");
@@ -1843,7 +1843,7 @@ static void WXInstallRouterHooks(void) {
     SEL s2 = NSSelectorFromString(@"openSensitiveURL:");
     Method m2 = class_getInstanceMethod(router, s2);
     if (m2 && method_getNumberOfArguments(m2) == 3) {
-        o_router_openSensitive = (BOOL (*)(id, SEL, NSURL *))method_setImplementation(m2, (IMP)h_router_openSensitive);
+        o_router_openSensitive = (BOOL (*)(__unsafe_unretained id, SEL, __unsafe_unretained NSURL *))method_setImplementation(m2, (IMP)h_router_openSensitive);
         WXLOG(@"挂钩成功：HFOpenURLRouter openSensitiveURL:");
     } else {
         WXLOG(@"挂钩跳过：HFOpenURLRouter openSensitiveURL: 参数数不符");
