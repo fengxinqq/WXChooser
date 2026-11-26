@@ -34,7 +34,25 @@ static void WXWriteLog(NSString *line) {
 static void (*o_sbmw_execute)(id, SEL, id, unsigned long long, id) = NULL;
 
 static volatile BOOL gWXBusy = NO;
+static CFAbsoluteTime gWXBusyAt = 0;
 static volatile BOOL gWXDialoging = NO;
+
+// 忙碌标记最多只认 3 秒：万一某次异常没复位，也不会把后面的拦截全部吃掉
+static BOOL WXIsBusy(void) {
+    if (!gWXBusy) return NO;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (gWXBusyAt > 0 && now - gWXBusyAt > 3.0) {
+        WXWriteLog([NSString stringWithFormat:@"忙碌标记超时（%.1f 秒），自动复位", now - gWXBusyAt]);
+        gWXBusy = NO;
+        gWXBusyAt = 0;
+        return NO;
+    }
+    return YES;
+}
+static void WXWSetBusy(BOOL on) {
+    gWXBusy = on;
+    gWXBusyAt = on ? CFAbsoluteTimeGetCurrent() : 0;
+}
 static CFAbsoluteTime gWXCooldownUntil = 0;
 static NSString *gWXLastWXURL = nil;
 static UIImage *WXAppIcon(NSString *bid);
@@ -313,14 +331,14 @@ static UIViewController *WXTopViewController(void) {
 }
 
 static void WXOpenPassthrough(NSURL *url, NSDictionary *options, void (^done)(BOOL)) {
-    gWXBusy = YES;
+    WXWSetBusy(YES);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (gWXBusy) { gWXBusy = NO; WXLOG(@"放行等待超时，解除忙碌标记"); }
+        if (gWXBusy) { WXWSetBusy(NO); WXLOG(@"放行等待超时，解除忙碌标记"); }
     });
     void (^fire)(void) = ^{
         [[UIApplication sharedApplication] openURL:url options:options ?: @{} completionHandler:^(BOOL ok) {
             WXLOG(@"原样放行结果=%d url=%@", ok, url.absoluteString);
-            gWXBusy = NO;
+            WXWSetBusy(NO);
             if (done) done(ok);
         }];
     };
@@ -365,17 +383,17 @@ static BOOL WXOpenByBundleID(NSURL *url, NSString *bid, void (^done)(BOOL)) {
         if (![ws respondsToSelector:sel]) continue;
         @try {
             BOOL ok = NO;
-            gWXBusy = YES;
+            WXWSetBusy(YES);
             if ([sn hasSuffix:@"allowUnlock:"]) {
                 ok = ((BOOL (*)(id, SEL, id, id, BOOL))objc_msgSend)(ws, sel, url, bid, YES);
             } else {
                 ok = ((BOOL (*)(id, SEL, id, id))objc_msgSend)(ws, sel, url, bid);
             }
-            gWXBusy = NO;
+            WXWSetBusy(NO);
             WXLOG(@"私有接口 %@ -> %d", sn, ok);
             if (ok) { if (done) done(YES); return YES; }
         } @catch (NSException *e) {
-            gWXBusy = NO;
+            WXWSetBusy(NO);
             WXLOG(@"私有接口异常 %@ %@", sn, e.reason);
         }
     }
@@ -1006,10 +1024,9 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
 
 // 返回 YES 表示已经由本插件接管（调用方应直接返回成功）
 static BOOL WXTryIntercept(NSURL *url, NSDictionary *options, void (^completion)(BOOL), NSString *entry) {
-    if (gWXBusy) return NO;
     NSString *selfBid = WXSelfBundleID();
     BOOL inSpringBoard = [selfBid isEqualToString:@"com.apple.springboard"];
-    WXLOG(@"[%@] 入口调用 App=%@ url=%@ opts=%@", entry, selfBid ?: @"(未知)", url.absoluteString ?: @"(无)", options ? [(NSDictionary *)options description] : @"(空)");
+    WXLOG(@"[%@] 入口调用 App=%@ 忙=%@ url=%@", entry, selfBid ?: @"(未知)", WXIsBusy() ? @"是" : @"否", url.absoluteString ?: @"(无)");
     if (inSpringBoard) {
         // 微信已在运行时，跳转不再产生启动事务，只走 SB 的 URL 路由；这条以前被我们直接放行了
         return WXSBInterceptURL(url, entry);
@@ -1051,63 +1068,63 @@ static BOOL (*o_ext_openURL)(id, SEL, NSURL *, void (^)(BOOL)) = NULL;
 static BOOL h_app_openURL_opts(id self, SEL _cmd, NSURL *url, NSDictionary *opts, void (^cb)(BOOL)) {
     if (WXTryIntercept(url, opts, cb, @"UIApplication openURL:options:")) return YES;
     if (!o_app_openURL_opts) return NO;
-    gWXBusy = YES;
+    WXWSetBusy(YES);
     BOOL r = o_app_openURL_opts(self, _cmd, url, opts, cb);
-    gWXBusy = NO;
+    WXWSetBusy(NO);
     return r;
 }
 
 static BOOL h_app_openURL(id self, SEL _cmd, NSURL *url) {
     if (WXTryIntercept(url, @{}, nil, @"UIApplication openURL:")) return YES;
     if (!o_app_openURL) return NO;
-    gWXBusy = YES;
+    WXWSetBusy(YES);
     BOOL r = o_app_openURL(self, _cmd, url);
-    gWXBusy = NO;
+    WXWSetBusy(NO);
     return r;
 }
 
 static BOOL h_app__openURL_opts(id self, SEL _cmd, NSURL *url, id opts) {
     if (WXTryIntercept(url, [opts isKindOfClass:[NSDictionary class]] ? opts : @{}, nil, @"UIApplication _openURL:options:")) return YES;
     if (!o_app__openURL_opts) return NO;
-    gWXBusy = YES;
+    WXWSetBusy(YES);
     BOOL r = o_app__openURL_opts(self, _cmd, url, opts);
-    gWXBusy = NO;
+    WXWSetBusy(NO);
     return r;
 }
 
 static BOOL h_lsw_openURL(id self, SEL _cmd, NSURL *url) {
     if (WXTryIntercept(url, @{}, nil, @"LSWorkspace openURL:")) return YES;
     if (!o_lsw_openURL) return NO;
-    gWXBusy = YES;
+    WXWSetBusy(YES);
     BOOL r = o_lsw_openURL(self, _cmd, url);
-    gWXBusy = NO;
+    WXWSetBusy(NO);
     return r;
 }
 
 static BOOL h_lsw_openURL_opts(id self, SEL _cmd, NSURL *url, id opts) {
     if (WXTryIntercept(url, [opts isKindOfClass:[NSDictionary class]] ? opts : @{}, nil, @"LSWorkspace openURL:withOptions:")) return YES;
     if (!o_lsw_openURL_opts) return NO;
-    gWXBusy = YES;
+    WXWSetBusy(YES);
     BOOL r = o_lsw_openURL_opts(self, _cmd, url, opts);
-    gWXBusy = NO;
+    WXWSetBusy(NO);
     return r;
 }
 
 static BOOL h_lsw_openSensitive(id self, SEL _cmd, NSURL *url, id opts) {
     if (WXTryIntercept(url, [opts isKindOfClass:[NSDictionary class]] ? opts : @{}, nil, @"LSWorkspace openSensitiveURL:withOptions:")) return YES;
     if (!o_lsw_openSensitive) return NO;
-    gWXBusy = YES;
+    WXWSetBusy(YES);
     BOOL r = o_lsw_openSensitive(self, _cmd, url, opts);
-    gWXBusy = NO;
+    WXWSetBusy(NO);
     return r;
 }
 
 static BOOL h_ext_openURL(id self, SEL _cmd, NSURL *url, void (^cb)(BOOL)) {
     if (WXTryIntercept(url, @{}, cb, @"NSExtensionContext openURL:")) return YES;
     if (!o_ext_openURL) return NO;
-    gWXBusy = YES;
+    WXWSetBusy(YES);
     BOOL r = o_ext_openURL(self, _cmd, url, cb);
-    gWXBusy = NO;
+    WXWSetBusy(NO);
     return r;
 }
 
@@ -1117,25 +1134,25 @@ static BOOL (*o_lsw_openURL_bid_unlock)(id, SEL, NSURL *, id, BOOL) = NULL;
 
 static BOOL h_app_canOpenURL(id self, SEL _cmd, NSURL *url) {
     BOOL r = o_app_canOpenURL ? o_app_canOpenURL(self, _cmd, url) : NO;
-    if (!gWXBusy && WXIsTargetURL(url)) WXLOG(@"CAN canOpenURL %@ -> %d", url.absoluteString, r);
+    if (!WXIsBusy() && WXIsTargetURL(url)) WXLOG(@"CAN canOpenURL %@ -> %d", url.absoluteString, r);
     return r;
 }
 
 static BOOL h_lsw_openURL_bid(id self, SEL _cmd, NSURL *url, id bid) {
     if (WXTryIntercept(url, @{}, nil, [NSString stringWithFormat:@"LSWorkspace openURL:withBundleIdentifier: %@", bid])) return YES;
     if (!o_lsw_openURL_bid) return NO;
-    gWXBusy = YES;
+    WXWSetBusy(YES);
     BOOL r = o_lsw_openURL_bid(self, _cmd, url, bid);
-    gWXBusy = NO;
+    WXWSetBusy(NO);
     return r;
 }
 
 static BOOL h_lsw_openURL_bid_unlock(id self, SEL _cmd, NSURL *url, id bid, BOOL allow) {
     if (WXTryIntercept(url, @{}, nil, [NSString stringWithFormat:@"LSWorkspace openURL:withBundleIdentifier:allowUnlock: %@", bid])) return YES;
     if (!o_lsw_openURL_bid_unlock) return NO;
-    gWXBusy = YES;
+    WXWSetBusy(YES);
     BOOL r = o_lsw_openURL_bid_unlock(self, _cmd, url, bid, allow);
-    gWXBusy = NO;
+    WXWSetBusy(NO);
     return r;
 }
 
@@ -1252,7 +1269,7 @@ static void WXLSAsyncOpen(NSString *bid, NSURL *url) {
 static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
     @try {
         if (!bid.length) return NO;
-        gWXBusy = YES;
+        WXWSetBusy(YES);
         gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 2.0;
 
         WXLOG(@"外部启动器接管 bid=%@ url=%@", bid, url.absoluteString ?: @"(无)");
@@ -1268,7 +1285,7 @@ static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
             WXLOG(@"候选 %@ 可执行=%d", p, exe);
             if (exe) { bin = p; break; }
         }
-        if (!bin) { WXLOG(@"全部候选都不可执行"); gWXBusy = NO; return NO; }
+        if (!bin) { WXLOG(@"全部候选都不可执行"); WXWSetBusy(NO); return NO; }
         [fm setAttributes:@{NSFilePosixPermissions:@(0755)} ofItemAtPath:bin error:nil];
 
         NSString *cmdPath = @"/var/mobile/wxchooser_cmd.plist";
@@ -1282,10 +1299,10 @@ static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
         pid_t pid = 0;
         int rc = posix_spawn(&pid, path, NULL, NULL, argsv, envv);
         WXLOG(@"spawn %@ rc=%d errno=%d pid=%d", bin, rc, errno, (int)pid);
-        gWXBusy = NO;
+        WXWSetBusy(NO);
         return (rc == 0);
     } @catch (NSException *e) {
-        gWXBusy = NO;
+        WXWSetBusy(NO);
         WXLOG(@"拉起动作异常 %@", e.reason);
         return NO;
     }
@@ -1459,7 +1476,7 @@ static BOOL WXSBInterceptURL(NSURL *url, NSString *entry) {
 static BOOL h_router_openURL(id self, SEL _cmd, NSURL *url) {
     @try {
         WXLOG(@"[HFOpenURLRouter openURL:] %@", url.absoluteString);
-        if (!gWXBusy && url && WXIsTargetURL(url) && !WXIsSelfWeChat()) {
+        if (!WXIsBusy() && url && WXIsTargetURL(url) && !WXIsSelfWeChat()) {
             NSURL *u = url;
             WXSBShowChooser(u, @"openURL:", ^{
                 if (o_router_openURL) o_router_openURL(self, _cmd, u);
@@ -1475,7 +1492,7 @@ static BOOL h_router_openURL(id self, SEL _cmd, NSURL *url) {
 static BOOL h_router_openSensitive(id self, SEL _cmd, NSURL *url) {
     @try {
         WXLOG(@"[HFOpenURLRouter openSensitiveURL:] %@", url.absoluteString);
-        if (!gWXBusy && url && WXIsTargetURL(url) && !WXIsSelfWeChat()) {
+        if (!WXIsBusy() && url && WXIsTargetURL(url) && !WXIsSelfWeChat()) {
             NSURL *u = url;
             WXSBShowChooser(u, @"openSensitiveURL:", ^{
                 if (o_router_openSensitive) o_router_openSensitive(self, _cmd, u);
@@ -1666,7 +1683,7 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
     BOOL shouldShow = NO;
     NSURL *hitURL = nil;
     @try {
-        if (!gWXBusy && !gWXOverlayVisible && !gWXGuardTripped && CFAbsoluteTimeGetCurrent() > gWXSuppressUntil) {
+        if (!WXIsBusy() && !gWXOverlayVisible && !gWXGuardTripped && CFAbsoluteTimeGetCurrent() > gWXSuppressUntil) {
             NSString *bid = WXBundleFromRequest(request);
             NSURL *u = WXLookupURL(request, 0);
             BOOL bidKnown = [bid hasPrefix:@"com.tencent.xin"];
@@ -1866,7 +1883,7 @@ __attribute__((constructor)) static void WXInit(void) {
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification *n) {
             if (gWXBusy || gWXDialoging) WXLOG(@"回到前台，清理忙碌/弹窗状态");
-            gWXBusy = NO;
+            WXWSetBusy(NO);
             gWXDialoging = NO;
         }];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
