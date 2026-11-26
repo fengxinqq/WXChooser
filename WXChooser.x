@@ -1213,23 +1213,20 @@ static WXLaunchRunner *gWXRunner = nil;
 
 static void WXLaunchChosen(NSURL *url, NSDictionary *cand, NSDictionary *options, void (^completion)(BOOL)) {
     NSString *bid = cand[@"bid"];
-    WXLOG(@"选择后交棒 SB：target=%@ url=%@", bid ?: @"(空)", url.absoluteString ?: @"(空)");
-    BOOL posted = NO;
-    @try { posted = WXPostSBLaunch(bid, url); } @catch (NSException *e) { WXLOG(@"交棒异常 %@", e.reason); }
-    WXLOG(@"交棒结果=%d", posted);
+    NSString *scheme = cand[@"scheme"];
+    WXLOG(@"选择后原样交给系统 target=%@ url=%@", bid ?: @"(空)", url.absoluteString ?: @"(空)");
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
-        NSString *back = nil;
-        @try { back = [UIPasteboard generalPasteboard].string; } @catch (NSException *e) { }
-        if ([back hasPrefix:@"WXRES\x01"]) {
-            NSString *txt = [[back componentsSeparatedByString:@"\x01"] componentsJoinedByString:@" "];
-            WXShowDiagHUD([NSString stringWithFormat:@"SB 回执：%@", txt]);
-        } else {
-            WXShowDiagHUD([NSString stringWithFormat:@"SB 没回执（交棒=%d，剪贴板=%@）", posted, back.length ? @"有内容" : @"空"]);
+    WXOpenPassthrough(url, options, ^(BOOL ok) {
+        WXLOG(@"原样打开结果=%d", ok);
+        if (!ok && scheme.length) {
+            WXOpenByScheme(url, scheme, ^(BOOL ok2) {
+                WXLOG(@"改写后打开结果=%d", ok2);
+                if (completion) completion(YES);
+            });
+            return;
         }
+        if (completion) completion(YES);
     });
-    if (completion) completion(YES);
 }
 
 static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDictionary *options, void (^completion)(BOOL)) {
