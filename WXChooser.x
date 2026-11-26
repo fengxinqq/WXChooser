@@ -14,19 +14,38 @@
 
 static NSString *const kWXLogPath = @"/var/mobile/wxchooser.log";
 
+static NSString *WXLocalLogPath(void) {
+    @try {
+        NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        if (dir.length) return [dir stringByAppendingPathComponent:@"wxchooser.log"];
+    } @catch (NSException *e) { }
+    return nil;
+}
+
 static void WXWriteLog(NSString *line) {
     NSString *s = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], line];
+    BOOL wrote = NO;
     @try {
         NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kWXLogPath];
         if (!fh) {
-            [s writeToFile:kWXLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            return;
+            wrote = [s writeToFile:kWXLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        } else {
+            [fh seekToEndOfFile];
+            [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+            wrote = YES;
         }
-        [fh seekToEndOfFile];
-        [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
-    } @catch (NSException *e) {
-    }
+    } @catch (NSException *e) { wrote = NO; }
+    if (wrote) return;
+    NSString *lp = WXLocalLogPath();
+    if (!lp.length) return;
+    @try {
+        NSFileHandle *fh2 = [NSFileHandle fileHandleForWritingAtPath:lp];
+        if (!fh2) { [s writeToFile:lp atomically:YES encoding:NSUTF8StringEncoding error:nil]; return; }
+        [fh2 seekToEndOfFile];
+        [fh2 writeData:[s dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh2 closeFile];
+    } @catch (NSException *e) { }
 }
 
 #define WXLOG(...) WXWriteLog([NSString stringWithFormat:__VA_ARGS__])
@@ -982,54 +1001,99 @@ static double WXAppSheetAge(void) {
     } @catch (NSException *e) { return 9999.0; }
 }
 
+static UIWindow *gWXDiagWin = nil;
+
+static void WXShowDiagHUD(NSString *text) {
+    @try {
+        if (gWXDiagWin) { [gWXDiagWin removeFromSuperview]; gWXDiagWin.hidden = YES; gWXDiagWin = nil; }
+        UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        w.windowLevel = UIWindowLevelAlert + 1;
+        w.backgroundColor = [UIColor clearColor];
+        UIViewController *vc = [[UIViewController alloc] init];
+        vc.view.backgroundColor = [UIColor clearColor];
+        UILabel *lab = [[UILabel alloc] initWithFrame:CGRectInset(w.bounds, 24, 0)];
+        lab.numberOfLines = 0;
+        lab.text = text;
+        lab.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+        lab.textColor = [UIColor whiteColor];
+        lab.textAlignment = NSTextAlignmentCenter;
+        UIView *bg = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w.bounds.size.width - 48, 0)];
+        bg.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.82];
+        bg.layer.cornerRadius = 14;
+        [vc.view addSubview:bg];
+        [vc.view addSubview:lab];
+        lab.frame = CGRectMake(20, 0, w.bounds.size.width - 88, 0);
+        [lab sizeToFit];
+        CGFloat h = lab.bounds.size.height + 36;
+        bg.frame = CGRectMake(24, w.bounds.size.height / 2 - h / 2, w.bounds.size.width - 48, h);
+        lab.frame = CGRectMake(40, bg.frame.origin.y + 18, w.bounds.size.width - 80, lab.bounds.size.height);
+        w.rootViewController = vc;
+        w.hidden = NO;
+        gWXDiagWin = w;
+        WXLOG(@"诊断 HUD 已显示：%@", text);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (gWXDiagWin == w) { w.hidden = YES; gWXDiagWin = nil; }
+        });
+    } @catch (NSException *e) { WXLOG(@"HUD 异常 %@", e.reason); }
+}
+
 static void WXLaunchChosen(NSURL *url, NSDictionary *cand, NSDictionary *options, void (^completion)(BOOL)) {
     NSString *bid = cand[@"bid"];
     NSString *scheme = cand[@"scheme"];
-    WXPostLaunchingNote();
     BOOL isWebURL = !WXIsWeixinScheme(url.scheme ?: @"");
     NSMutableString *steps = [NSMutableString string];
-    BOOL handled = NO;
+    WXPostLaunchingNote();
 
-    BOOL r1 = bid.length ? WXOpenByBundleID(url, bid, nil) : NO;
-    [steps appendFormat:@"1 按包名+链接 %d\n", r1];
-    if (r1) handled = YES;
+    __block BOOL done = NO;
+    __block NSInteger step = 0;
+    __block void (^runNext)(void);
+    __weak void (^weakNext)(void);
 
-    BOOL r2 = NO;
-    if (!handled && bid.length) { r2 = WXLaunchBySBS(url, bid); handled = r2; }
-    if (!handled) [steps appendFormat:@"2 系统SBS+链接 %d\n", r2];
-
-    BOOL r3 = NO;
-    if (!handled && !isWebURL && scheme.length) {
-        r3 = WXOpenByScheme(url, scheme, ^(BOOL ok) { if (!ok) WXLOG(@"scheme 方式打开失败：%@", scheme); });
-        handled = r3;
-    }
-    if (!handled && !isWebURL) [steps appendFormat:@"3 改链接 %@ %d\n", scheme ?: @"(无)", r3];
-
-    BOOL r4 = NO;
-    if (!handled && bid.length) { r4 = WXLaunchBySBS(nil, bid); handled = r4; }
-    if (!handled && bid.length) [steps appendFormat:@"4 仅启动App %d\n", r4];
-
-    if (!handled) {
-        [steps appendString:@"5 回退系统默认"];
-        WXOpenPassthrough(url, options, completion);
-    } else {
-        gWXBusy = NO;
+    void (^finish)(BOOL) = ^(BOOL ok) {
+        if (done) return;
+        done = YES;
+        WXLOG(@"选择结果 target=%@ url=%@ ok=%d\n%@", bid ?: @"(空)", url.absoluteString ?: @"(空)", ok, steps);
+        if (ok) { gWXBusy = NO; gWXBusyAt = 0; }
         if (completion) completion(YES);
-    }
+        if (!ok) {
+            WXShowDiagHUD([NSString stringWithFormat:@"没跳转 (%@)\n%@", bid ?: @"?", steps]);
+        }
+    };
 
-    // 1.5 秒后自检：还留在前台说明没跳走，把每一步结果弹出来
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
-        WXLOG(@"自检：仍在当前应用，弹窗提示诊断结果");
-        UIViewController *top = WXTopViewController();
-        if (!top) return;
-        NSString *msg = [NSString stringWithFormat:@"目标 %@\n链接 %@\n%@", bid ?: @"(空)",
-                         url.absoluteString ?: @"(空)", steps];
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"没跳转到微信"
-                                                                   message:msg
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
-        [top presentViewController:ac animated:YES completion:nil];
+    runNext = ^{
+        if (done) return;
+        BOOL fired = NO;
+        NSString *label = nil;
+        switch (step) {
+            case 0: label = @"1 包名+链接"; fired = bid.length ? WXOpenByBundleID(url, bid, nil) : NO; break;
+            case 1: label = @"2 系统SBS+链接"; fired = bid.length ? WXLaunchBySBS(url, bid) : NO; break;
+            case 2: label = @"3 仅启动App"; fired = bid.length ? WXLaunchBySBS(nil, bid) : NO; break;
+            case 3:
+                if (isWebURL) { step++; if (weakNext) weakNext(); return; }
+                label = @"4 改链接"; fired = scheme.length ? WXOpenByScheme(url, scheme, nil) : NO;
+                break;
+            case 4: label = @"5 系统默认"; fired = YES; WXOpenPassthrough(url, options, nil); break;
+            default: finish(NO); return;
+        }
+        step++;
+        [steps appendFormat:@"%@ 返回%d\n", label, fired];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (done) return;
+            if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
+                [steps appendString:@"→ 已离开当前应用"];
+                finish(YES);
+                return;
+            }
+            if (weakNext) weakNext();
+        });
+    };
+
+    runNext = [runNext copy];
+    weakNext = runNext;
+    runNext();
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        finish(NO);
     });
 }
 
