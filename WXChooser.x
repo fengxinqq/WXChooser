@@ -61,6 +61,7 @@ static NSString *WXRealNameForBid(NSString *bid);
 static NSString *WXBundlePathForBid(NSString *bid);
 static NSString *WXNameFromAppPath(NSString *dir);
 static UIViewController *gWXHostVC = nil;
+static UIWindow *gWXHostWin = nil;
 static void WXSBHideOverlay(void);
 static void WXPostSheetDismiss(void);
 static double WXAppSheetAge(void);
@@ -767,6 +768,7 @@ static WXSheetRowTarget *gWXSheetTarget = nil;
     [UIView animateWithDuration:0.16 animations:^{ c.alpha = 0.0; } completion:^(BOOL finished) { [c removeFromSuperview]; }];
 }
 - (void)onRowTap:(UIButton *)sender {
+    WXLOG(@"菜单收到触摸 行=%ld", (long)sender.tag);
     NSInteger idx = sender.tag;
     NSArray *cands = gWXSheetCands;
     void (^pick)(NSDictionary *) = gWXSheetPick;
@@ -778,6 +780,7 @@ static WXSheetRowTarget *gWXSheetTarget = nil;
     if (cands && idx >= 0 && idx < (NSInteger)cands.count && pick) pick(cands[idx]);
 }
 - (void)onCancelTap:(UIButton *)sender {
+    WXLOG(@"菜单收到触摸 取消键");
     void (^cancel)(void) = gWXSheetCancel;
     gWXSheetPick = nil;
     gWXSheetCancel = nil;
@@ -1345,7 +1348,10 @@ static void WXSBHideOverlay(void) {
             [gWXHostVC dismissViewControllerAnimated:NO completion:nil];
         }
         gWXOverlayVisible = NO;
-        if (gWXOverlayWin) { gWXOverlayWin.hidden = YES; }
+        if (gWXOverlayWin && gWXOverlayWin == gWXHostWin) { gWXOverlayWin.hidden = YES; }
+        gWXOverlayWin = nil;
+        gWXHostWin = nil;
+        gWXHostVC = nil;
         WXLOG(@"SB 弹框已关闭");
     } @catch (NSException *e) {
         WXLOG(@"关闭弹框异常 %@", e.reason);
@@ -1355,22 +1361,54 @@ static void WXSBHideOverlay(void) {
 static UIWindow *gWXOverlayWin = nil;
 
 static BOOL WXSBEnsureOverlay(void) {
-    if (gWXHostVC && gWXOverlayWin) return YES;
+    if (gWXHostVC && gWXHostWin) return YES;
     @try {
-        // 必须用能接收触摸的窗口：之前借 SpringBoard 的壁纸窗口（level=-3）根本点不动
-        if (!gWXOverlayWin) {
-            UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-            w.windowLevel = UIWindowLevelAlert + 1;
-            w.backgroundColor = [UIColor clearColor];
-            UIViewController *vc = [[UIViewController alloc] init];
-            vc.view.backgroundColor = [UIColor clearColor];
-            w.rootViewController = vc;
-            w.hidden = NO;
-            gWXOverlayWin = w;
-            gWXHostVC = vc;
-            WXLOG(@"SB 弹框宿主就绪 自建窗口 level=%.0f", w.windowLevel);
+        NSArray *wins = [UIApplication sharedApplication].windows;
+        for (UIWindow *w in wins) {
+            WXLOG(@"SB 窗口 %@ level=%.0f hidden=%d rootVC=%@",
+                  NSStringFromClass([w class]), w.windowLevel, w.hidden ? 1 : 0,
+                  w.rootViewController ? NSStringFromClass([w.rootViewController class]) : @"(无)");
         }
-        return gWXHostVC != nil;
+        UIWindow *host = nil;
+        // 首选：正层级的 SpringBoard 主窗口（1.32 就是挂它，点击有效）
+        for (UIWindow *w in wins) {
+            NSString *cn = NSStringFromClass([w class]);
+            if ([cn.lowercaseString containsString:@"wallpaper"]) continue;
+            if (!w.hidden && w.rootViewController && w.windowLevel >= 0.0 &&
+                w.windowLevel < UIWindowLevelAlert) { host = w; break; }
+        }
+        if (!host) {
+            for (UIWindow *w in wins) {
+                NSString *cn = NSStringFromClass([w class]);
+                if ([cn.lowercaseString containsString:@"wallpaper"]) continue;
+                if (w.rootViewController && w.windowLevel >= 0.0 &&
+                    w.windowLevel < UIWindowLevelAlert) { host = w; break; }
+            }
+        }
+        if (host) {
+            gWXHostWin = host;
+            gWXHostVC = host.rootViewController;
+            [gWXHostVC view];
+            if (host.hidden) { host.hidden = NO; WXLOG(@"宿主窗口原为隐藏，已显示"); }
+            WXLOG(@"SB 弹框宿主就绪 %@ level=%.0f", NSStringFromClass([host class]), host.windowLevel);
+            return gWXHostVC != nil;
+        }
+        // 兜底：自建窗口，必须挂到已有窗口的 windowScene，否则不渲染也收不到触摸
+        UIWindowScene *scene = nil;
+        for (UIWindow *w in wins) { if (w.windowScene) { scene = w.windowScene; break; } }
+        UIWindow *w = scene ? [[UIWindow alloc] initWithWindowScene:scene]
+                            : [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        w.windowLevel = UIWindowLevelAlert + 1;
+        w.backgroundColor = [UIColor clearColor];
+        UIViewController *vc = [[UIViewController alloc] init];
+        vc.view.backgroundColor = [UIColor clearColor];
+        w.rootViewController = vc;
+        w.hidden = NO;
+        gWXOverlayWin = w;
+        gWXHostWin = w;
+        gWXHostVC = vc;
+        WXLOG(@"SB 弹框宿主就绪 自建窗口 level=%.0f scene=%d", w.windowLevel, scene ? 1 : 0);
+        return YES;
     } @catch (NSException *e) {
         WXLOG(@"建宿主窗口异常 %@", e.reason);
         return NO;
@@ -1424,6 +1462,9 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                 })) {
                 WXSetGuard(NO);
                 WXLOG(@"自绘菜单已呈现");
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    if (gWXSheetContainer) WXLOG(@"菜单 3 秒无触摸（点不动）");
+                });
                 return;
             }
 
