@@ -1424,9 +1424,9 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                 })) {
                 WXSetGuard(NO);
                 WXLOG(@"自绘菜单已呈现");
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                     if (gWXSheetContainer) {
-                        WXLOG(@"菜单 4 秒无人操作，自动关闭");
+                        WXLOG(@"菜单 10 秒无人操作，自动关闭");
                         WXRemoveSheetNow();
                         WXSBHideOverlay();
                         gWXDialoging = NO;
