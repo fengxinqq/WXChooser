@@ -40,6 +40,7 @@ static NSString *gWXLastWXURL = nil;
 static UIImage *WXAppIcon(NSString *bid);
 static UIImage *WXRealIconForBid(NSString *bid, NSString *path);
 static NSString *WXRealNameForBid(NSString *bid);
+static NSString *WXBundlePathForBid(NSString *bid);
 static NSString *WXNameFromAppPath(NSString *dir);
 static UIViewController *gWXHostVC = nil;
 static void WXSBHideOverlay(void);
@@ -247,7 +248,7 @@ static NSArray<NSDictionary *> *WXCandidatesForURL(NSURL *url) {
     {
         NSMutableArray *merged = [all mutableCopy] ?: [NSMutableArray array];
         NSArray *known = @[ WXKnownCandidate(@"com.tencent.xin", @"微信"),
-                            WXKnownCandidate(@"com.tencent.xinapp", @"如果") ];
+                            WXKnownCandidate(@"com.tencent.xinapp", @"微信") ];
         for (NSDictionary *k in known) {
             BOOL exists = NO;
             for (NSDictionary *a in all) {
@@ -287,10 +288,11 @@ static NSArray<NSDictionary *> *WXCandidatesForURL(NSURL *url) {
         }
         NSString *dispName = WXNameFromAppPath(a[@"path"]) ?: a[@"name"];
         if (!dispName.length) dispName = WXRealNameForBid(bid) ?: bid;
-        // 1.30：两个包 Info.plist 里都写「微信」，分身按包名还原成桌面上的名字
-        if ([bid isEqualToString:@"com.tencent.xinapp"] && [dispName isEqualToString:@"微信"]) dispName = @"如果";
-        NSMutableDictionary *m = [@{@"bid": bid, @"name": dispName ?: bid} mutableCopy];
-        if ([a[@"path"] isKindOfClass:[NSString class]]) m[@"path"] = a[@"path"];
+        // 1.32：名字一律按 App 自己的显示名（两个微信都叫「微信」）
+        NSString *appPath = [a[@"path"] isKindOfClass:[NSString class]] ? a[@"path"] : WXBundlePathForBid(bid);
+        if (!dispName.length && appPath.length) dispName = WXNameFromAppPath(appPath);
+        NSMutableDictionary *m = [@{@"bid": bid, @"name": dispName.length ? dispName : (bid ?: @"")} mutableCopy];
+        if (appPath.length) m[@"path"] = appPath;
         if (uniq) m[@"scheme"] = uniq;
         if (fallback) m[@"wxScheme"] = fallback;
         [res addObject:m];
@@ -605,6 +607,32 @@ static UIImage *WXIconFromAppPath(NSString *dir) {
     }
     if ([img isKindOfClass:[UIImage class]]) cache[dir] = img;
     return img;
+}
+
+static NSString *WXBundlePathForBid(NSString *bid) {
+    if (!bid.length) return nil;
+    static NSMutableDictionary *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    id hit = cache[bid];
+    if ([hit isKindOfClass:[NSString class]]) return [hit length] ? hit : nil;
+    NSString *path = nil;
+    @try {
+        Class pc = NSClassFromString(@"LSApplicationProxy");
+        SEL s = NSSelectorFromString(@"applicationProxyForIdentifier:");
+        id proxy = (pc && [pc respondsToSelector:s]) ? ((id (*)(id, SEL, id))objc_msgSend)(pc, s, bid) : nil;
+        for (NSString *selName in @[@"bundleURL", @"bundleContainerURL"]) {
+            SEL sel = NSSelectorFromString(selName);
+            if (![proxy respondsToSelector:sel]) continue;
+            id u = ((id (*)(id, SEL))objc_msgSend)(proxy, sel);
+            if (![u isKindOfClass:[NSURL class]]) continue;
+            NSString *pp = [(NSURL *)u path];
+            if ([pp hasSuffix:@".app"] && [[NSFileManager defaultManager] fileExistsAtPath:pp]) { path = pp; break; }
+        }
+    } @catch (NSException *e) { }
+    cache[bid] = path ?: @"";
+    if (path.length) WXLOG(@"按 bundle id 反查到 App 路径：%@ -> %@", bid, path);
+    return path;
 }
 
 static UIImage *WXIconViaProxy(NSString *bid) {
