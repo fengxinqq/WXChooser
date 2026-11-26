@@ -12,14 +12,7 @@ WXChooser_FRAMEWORKS = UIKit Foundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
-TOOL_NAME = wxchooseropen
-wxchooseropen_FILES = wxchooseropen_main.m
-wxchooseropen_FRAMEWORKS = Foundation UIKit
-wxchooseropen_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
-wxchooseropen_INSTALL_PATH = /usr/libexec
-wxchooseropen_CODESIGN_FLAGS = -Swxchooseropen.entitlements
-
-include $(THEOS_MAKE_PATH)/tool.mk
+# 1.73：不再编译/打包启动器，包里只留 dylib + plist
 
 STAGED_DYLIB = $(THEOS_STAGING_DIR)/Library/MobileSubstrate/DynamicLibraries/WXChooser.dylib
 

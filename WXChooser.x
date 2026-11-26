@@ -1433,6 +1433,31 @@ static void WXLSAsyncOpen(NSString *bid, NSURL *url) {
     } @catch (NSException *e) { WXLOG(@"LS 异步拉起异常 %@", e.reason); }
 }
 
+// 找当前可用的启动器；找不到返回 nil（1.73 起包里不再带启动器）
+static NSString *WXLauncherCandidate(void) {
+    NSMutableArray *paths = [NSMutableArray array];
+    [paths addObject:@"/usr/libexec/wxchooseropen"];
+    NSString *selfPath = WXOpenerPath();
+    if (selfPath) {
+        [paths addObject:selfPath];
+        NSString *dir = [selfPath stringByDeletingLastPathComponent];
+        if ([dir hasSuffix:@"/usr/lib/TweakInject"]) {
+            NSString *root = [dir stringByDeletingLastPathComponent];
+            root = [root stringByDeletingLastPathComponent];
+            root = [root stringByDeletingLastPathComponent];
+            [paths addObject:[root stringByAppendingPathComponent:@"usr/libexec/wxchooseropen"]];
+        }
+    }
+    [paths addObject:@"/usr/bin/wxchooseropen"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *p in paths) {
+        BOOL exe = [fm isExecutableFileAtPath:p];
+        WXLOG(@"候选 %@ 可执行=%d", p, exe);
+        if (exe) return p;
+    }
+    return nil;
+}
+
 static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
     @try {
         if (!bid.length) return NO;
@@ -1441,28 +1466,8 @@ static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
 
         WXLOG(@"外部启动器接管 bid=%@ url=%@", bid, url.absoluteString ?: @"(无)");
 
-        NSMutableArray *paths = [NSMutableArray array];
-        [paths addObject:@"/usr/libexec/wxchooseropen"];   // 1.71 起启动器改放这里，DynamicLibraries 保持干净
-        NSString *selfPath = WXOpenerPath();
-        if (selfPath) {
-            [paths addObject:selfPath];                      // 兼容旧安装位置
-            // 用自身路径反推真实根（roothide 下可能是 .jbroot-xxx/usr/lib/TweakInject/...）
-            NSString *dir = [selfPath stringByDeletingLastPathComponent];
-            if ([dir hasSuffix:@"/usr/lib/TweakInject"]) {
-                NSString *root = [dir stringByDeletingLastPathComponent];
-                root = [root stringByDeletingLastPathComponent];
-                root = [root stringByDeletingLastPathComponent];
-                [paths addObject:[root stringByAppendingPathComponent:@"usr/libexec/wxchooseropen"]];
-            }
-        }
-        [paths addObject:@"/usr/bin/wxchooseropen"];
         NSFileManager *fm = [NSFileManager defaultManager];
-        NSString *bin = nil;
-        for (NSString *p in paths) {
-            BOOL exe = [fm isExecutableFileAtPath:p];
-            WXLOG(@"候选 %@ 可执行=%d", p, exe);
-            if (exe) { bin = p; break; }
-        }
+        NSString *bin = WXLauncherCandidate();
         if (!bin) { WXLOG(@"全部候选都不可执行"); WXWSetBusy(NO); return NO; }
         [fm setAttributes:@{NSFilePosixPermissions:@(0755)} ofItemAtPath:bin error:nil];
 
@@ -1553,6 +1558,13 @@ static BOOL WXSBEnsureOverlay(void) {
 
 static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void)) {
     if (!WXSelfIntegrityOK()) { if (fallback) fallback(); return; }
+    // 1.73：包里不再带启动器。桌面这条线若找不到启动器，就别弹一个选完打不开的菜单，
+    // 直接放行，让系统按默认方式打开原生微信。
+    if (!WXLauncherCandidate()) {
+        WXLOG(@"SB 这条线没有启动器可用，直接放行原生跳转（%@）", entry);
+        if (fallback) fallback();
+        return;
+    }
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             NSURL *probe = url ?: [NSURL URLWithString:@"weixin://"];
