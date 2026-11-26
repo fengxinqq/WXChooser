@@ -1249,7 +1249,7 @@ static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
     @try {
         if (!bid.length) return NO;
         gWXBusy = YES;
-        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 14.0;
+        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 2.0;
 
         WXLOG(@"外部启动器接管 bid=%@ url=%@", bid, url.absoluteString ?: @"(无)");
 
@@ -1384,7 +1384,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                     NSString *bid = cand[@"bid"];
                     WXLOG(@"用户选择(自绘)：%@ (%@)", cand[@"name"], bid);
                     gWXDialoging = NO;
-                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 2.5;
+                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 1.0;
                     WXSBHideOverlay();
                     NSURL *u2 = url;
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -1394,7 +1394,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                 }, ^{
                     WXLOG(@"用户取消(自绘)");
                     gWXDialoging = NO;
-                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 2.5;
+                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 1.0;
                     WXSBHideOverlay();
                 })) {
                 WXSetGuard(NO);
@@ -1408,7 +1408,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                 UIAlertAction *act = [UIAlertAction actionWithTitle:nm style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
                     WXLOG(@"用户选择：%@ (%@)", nm, bid);
                     gWXDialoging = NO;
-                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 2.5;
+                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 1.0;
                     WXSBHideOverlay();
                     NSURL *u2 = url;
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -1422,7 +1422,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
             [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
                 WXLOG(@"用户取消");
                 gWXDialoging = NO;
-                gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 2.5;
+                gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 1.0;
                 WXSBHideOverlay();
             }]];
             [gWXHostVC presentViewController:ac animated:NO completion:^{
@@ -1692,9 +1692,9 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
                 if (u) gWXLastWXURL = u.absoluteString;
                 static CFAbsoluteTime lastHit = 0;
                 CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-                BOOL tooSoon = (now - lastHit < 1.2);
+                BOOL tooSoon = (now - lastHit < 0.6);
                 double appAge = WXAppSheetAge();
-                BOOL appHandled = (appAge < 3.0);
+                BOOL appHandled = (appAge < 1.0);
                 BOOL busyByDialog = (gWXDialoging || now < gWXCooldownUntil || appHandled);
                 if (appHandled) WXLOG(@"应用内已弹窗（%.1f 秒前），SB 不再重复弹框", appAge);
                 if (busyByDialog) {
@@ -1814,9 +1814,9 @@ __attribute__((constructor)) static void WXInit(void) {
             NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:kWXGuard error:nil];
             NSDate *mt = attrs[NSFileModificationDate];
             double age = mt ? [[NSDate date] timeIntervalSinceDate:mt] : 9999.0;
-            if (age >= 0 && age < 90.0) {
+            if (age >= 0 && age < 3.0) {
                 gWXGuardTripped = YES;
-                WXLOG(@"⚠ 护栏文件较新（%.0f 秒前），本会话不再弹框（直接放行）", age);
+                WXLOG(@"⚠ 护栏文件很新（%.1f 秒前），稍后恢复弹框", age);
             } else {
                 WXLOG(@"清理过期护栏文件（%.0f 秒），恢复正常弹框", age);
             }
