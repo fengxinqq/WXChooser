@@ -510,10 +510,6 @@ static void WXHandleSBLaunchFromPasteboard(void) {
     NSString *us = parts[2];
     NSURL *u = us.length ? [NSURL URLWithString:us] : nil;
     WXLOG(@"SB: 代为启动 bid=%@ url=%@", bid, us);
-    // 用 1.32 验证过的那条路：由 SpringBoard 拉起外部启动器，按包名打开
-    BOOL helperOk = NO;
-    @try { helperOk = WXSBLaunchByBundle(u, bid); } @catch (NSException *e) { WXLOG(@"SB: 外部启动器异常 %@", e.reason); }
-    WXLOG(@"SB: 外部启动器结果=%d", helperOk);
     WXLoadSBS();
     int r = -1;
     @try {
@@ -529,6 +525,11 @@ static void WXHandleSBLaunchFromPasteboard(void) {
             WXLOG(@"SB: SBS只启动 r=%d", r);
         }
     } @catch (NSException *e) { WXLOG(@"SB: 代为启动异常 %@", e.reason); }
+    if (r != 0) {
+        BOOL helperOk = NO;
+        @try { helperOk = WXSBLaunchByBundle(u, bid); } @catch (NSException *e) { WXLOG(@"SB: 外部启动器异常 %@", e.reason); }
+        WXLOG(@"SB: SBS 失败，外部启动器结果=%d", helperOk);
+    }
 }
 
 static void WXSBCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
@@ -1198,28 +1199,17 @@ static WXLaunchRunner *gWXRunner = nil;
 @end
 
 static void WXLaunchChosen(NSURL *url, NSDictionary *cand, NSDictionary *options, void (^completion)(BOOL)) {
-    // 回到 1.32 的做法：不发广播、不调私有启动接口、不拉外部程序，只把链接交给系统
     NSString *bid = cand[@"bid"];
-    NSString *scheme = cand[@"scheme"];
-    BOOL isWebURL = !WXIsWeixinScheme(url.scheme ?: @"");
-    WXLOG(@"选择后按 1.32 方式打开 target=%@ url=%@ scheme=%@", bid ?: @"(空)", url.absoluteString ?: @"(空)", scheme ?: @"(无)");
+    WXLOG(@"选择后交棒 SB：target=%@ url=%@", bid ?: @"(空)", url.absoluteString ?: @"(空)");
+    BOOL posted = NO;
+    @try { posted = WXPostSBLaunch(bid, url); } @catch (NSException *e) { WXLOG(@"交棒异常 %@", e.reason); }
+    WXLOG(@"交棒结果=%d", posted);
 
-    BOOL fired = NO;
-    @try {
-        if (!isWebURL && scheme.length) {
-            fired = WXOpenByScheme(url, scheme, ^(BOOL ok) {
-                WXLOG(@"系统打开回调 ok=%d", ok);
-                if (completion) completion(YES);
-            });
-        }
-    } @catch (NSException *e) { WXLOG(@"改写 scheme 异常 %@", e.reason); fired = NO; }
-
-    if (!fired) {
-        WXLOG(@"改写 scheme 未生效，改为原样交给系统");
-        WXOpenPassthrough(url, options, ^(BOOL ok) {
-            if (completion) completion(YES);
-        });
-    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+        WXShowDiagHUD([NSString stringWithFormat:@"SB 没把 %@ 拉起来（交棒=%d）", bid ?: @"?", posted]);
+    });
+    if (completion) completion(YES);
 }
 
 static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDictionary *options, void (^completion)(BOOL)) {
