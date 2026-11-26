@@ -313,6 +313,9 @@ static UIViewController *WXTopViewController(void) {
 
 static void WXOpenPassthrough(NSURL *url, NSDictionary *options, void (^done)(BOOL)) {
     gWXBusy = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (gWXBusy) { gWXBusy = NO; WXLOG(@"放行等待超时，解除忙碌标记"); }
+    });
     void (^fire)(void) = ^{
         [[UIApplication sharedApplication] openURL:url options:options ?: @{} completionHandler:^(BOOL ok) {
             WXLOG(@"原样放行结果=%d url=%@", ok, url.absoluteString);
@@ -905,6 +908,7 @@ static void WXRemoveSheetNow(void) {
 static void WXSheetDismissCallback(CFNotificationCenterRef center, void *observer, CFNotificationName name, const void *object, CFDictionaryRef info) {
     dispatch_async(dispatch_get_main_queue(), ^{
         WXRemoveSheetNow();
+        gWXDialoging = NO;
     });
 }
 
@@ -1380,7 +1384,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                     NSString *bid = cand[@"bid"];
                     WXLOG(@"用户选择(自绘)：%@ (%@)", cand[@"name"], bid);
                     gWXDialoging = NO;
-                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 25.0;
+                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 2.5;
                     WXSBHideOverlay();
                     NSURL *u2 = url;
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -1390,7 +1394,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                 }, ^{
                     WXLOG(@"用户取消(自绘)");
                     gWXDialoging = NO;
-                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 25.0;
+                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 2.5;
                     WXSBHideOverlay();
                 })) {
                 WXSetGuard(NO);
@@ -1404,7 +1408,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                 UIAlertAction *act = [UIAlertAction actionWithTitle:nm style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
                     WXLOG(@"用户选择：%@ (%@)", nm, bid);
                     gWXDialoging = NO;
-                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 25.0;
+                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 2.5;
                     WXSBHideOverlay();
                     NSURL *u2 = url;
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -1418,7 +1422,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
             [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
                 WXLOG(@"用户取消");
                 gWXDialoging = NO;
-                gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 25.0;
+                gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 2.5;
                 WXSBHideOverlay();
             }]];
             [gWXHostVC presentViewController:ac animated:NO completion:^{
@@ -1838,6 +1842,14 @@ __attribute__((constructor)) static void WXInit(void) {
             WXInstallWorkspaceHook();
         });
     } else {
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *n) {
+            if (gWXBusy || gWXDialoging) WXLOG(@"回到前台，清理忙碌/弹窗状态");
+            gWXBusy = NO;
+            gWXDialoging = NO;
+        }];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             WXPostLoadedPing();
             WXLOG(@"已向 SB 报到：%@", WXSelfBundleID());
