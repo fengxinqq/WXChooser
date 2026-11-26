@@ -1558,13 +1558,7 @@ static BOOL WXSBEnsureOverlay(void) {
 
 static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void)) {
     if (!WXSelfIntegrityOK()) { if (fallback) fallback(); return; }
-    // 1.73：包里不再带启动器。桌面这条线若找不到启动器，就别弹一个选完打不开的菜单，
-    // 直接放行，让系统按默认方式打开原生微信。
-    if (!WXLauncherCandidate()) {
-        WXLOG(@"SB 这条线没有启动器可用，直接放行原生跳转（%@）", entry);
-        if (fallback) fallback();
-        return;
-    }
+
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             NSURL *probe = url ?: [NSURL URLWithString:@"weixin://"];
@@ -2005,14 +1999,10 @@ static void h_sbmw_execute(__unsafe_unretained id self, SEL _cmd, __unsafe_unret
         else WXLOG(@"静默拦截已完成，不重复弹框");
         return;
     }
-    if (gWXOverlayVisible) {
-        WXLOG(@"放行启动，立刻收掉残留菜单");
-        dispatch_async(dispatch_get_main_queue(), ^{
-            WXRemoveSheetNow();
-            WXSBHideOverlay();
-            gWXDialoging = NO;
-        });
-    }
+    // 1.74：这里原来只要有不相干的事务经过（旋转、切页、收尾）就把菜单一并收掉，
+    // 结果 QQ 这类“拒绝原事务后再产生系统收尾事务”的场景，菜单刚弹出就被自己扫掉。
+    // 现在菜单只由用户操作、或 10 秒超时关闭，别的事务一律不碰它。
+
     if (o_sbmw_execute) {
         @try { o_sbmw_execute(self, _cmd, request, options, validator); }
         @catch (NSException *e) { WXLOG(@"调用原方法异常 %@", e.reason); }
