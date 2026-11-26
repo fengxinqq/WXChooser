@@ -1,6 +1,6 @@
 Package: com.fengxin.wxchooser
 Name: WXChooser 微信跳转选择
-Version: 1.62
+Version: 1.63
 Architecture: iphoneos-arm64e
 Description: 第三方 App 跳转微信时弹出选择框，可自选微信本体或分身。
 Maintainer: 葑鈊

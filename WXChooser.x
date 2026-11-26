@@ -891,7 +891,7 @@ static BOOL WXShowSheet(UIView *host, NSArray<NSDictionary *> *cands, void (^pic
         UIButton *cancelBtn = [UIButton buttonWithType:UIButtonTypeCustom];
         cancelBtn.frame = CGRectMake(8.0, CGRectGetMaxY(card.frame) + gap, cardW, cancelH);
         [cancelBtn setTitle:@"取消" forState:UIControlStateNormal];
-        cancelBtn.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+        cancelBtn.titleLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
         [cancelBtn setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
         cancelBtn.backgroundColor = [UIColor secondarySystemBackgroundColor];
         cancelBtn.layer.cornerRadius = 14.0;
