@@ -2297,8 +2297,23 @@ static NSString *kWXPullFile = @"/var/mobile/wxchooser.pull.plist";
 
 static CGFloat WXPullAgeLimit(void) { return 40.0; }
 
+// 沙盒里的进程只能读自己的 Documents，所以先看自己容器里那份
+static NSString *WXPullPathForSelf(void) {
+    NSString *docs = WXAppDocsDir();
+    if (docs.length) {
+        NSString *p = [docs stringByAppendingPathComponent:@"wxchooser.pull.plist"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) return p;
+    }
+    return kWXPullFile;
+}
+
 static NSURL *WXPullURLForSelf(BOOL consume) {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kWXPullFile];
+    NSString *path = WXPullPathForSelf();
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:path];
+    if (![d isKindOfClass:[NSDictionary class]] && ![path isEqualToString:kWXPullFile]) {
+        d = [NSDictionary dictionaryWithContentsOfFile:kWXPullFile];
+        path = kWXPullFile;
+    }
     if (![d isKindOfClass:[NSDictionary class]]) return nil;
     NSString *bid = d[@"bid"];
     NSString *us = d[@"url"];
@@ -2306,7 +2321,7 @@ static NSURL *WXPullURLForSelf(BOOL consume) {
     if (!us.length || ![bid isEqualToString:WXSelfBundleID()]) return nil;
     double age = [[NSDate date] timeIntervalSince1970] - ts;
     if (age < 0 || age > WXPullAgeLimit()) return nil;
-    if (consume) [[NSFileManager defaultManager] removeItemAtPath:kWXPullFile error:nil];
+    if (consume) [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
     return [NSURL URLWithString:us];
 }
 

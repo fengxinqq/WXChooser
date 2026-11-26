@@ -100,13 +100,51 @@ static void markSelfLaunch(NSString *bid) {
     writePlist(@{ @"bid": bid ?: @"", @"ts": @([[NSDate date] timeIntervalSince1970]) }, kSelfMark);
 }
 
+// 找某个 App 的数据容器（root 能进，沙盒里的自己才读得到）
+static NSString *containerForBundle(NSString *bid) {
+    static NSMutableDictionary *cache = nil;
+    if (!cache) cache = [NSMutableDictionary dictionary];
+    if (cache[bid]) return cache[bid];
+    NSString *base = @"/var/mobile/Containers/Data/Application";
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *d in [fm contentsOfDirectoryAtPath:base error:nil]) {
+        NSString *c = [base stringByAppendingPathComponent:d];
+        NSString *meta = [c stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+        NSDictionary *m = [NSDictionary dictionaryWithContentsOfFile:meta];
+        NSString *mbid = m[@"MCBundleIdentifier"];
+        if (mbid.length && [mbid isEqualToString:bid]) { cache[bid] = c; return c; }
+    }
+    return nil;
+}
+
 static void writePull(NSString *bid, NSString *urlString) {
-    writePlist(@{ @"bid": bid ?: @"", @"url": urlString ?: @"", @"ts": @([[NSDate date] timeIntervalSince1970]) }, kPullFile);
+    NSDictionary *d = @{ @"bid": bid ?: @"", @"url": urlString ?: @"", @"ts": @([[NSDate date] timeIntervalSince1970]) };
+    // 全局一份（给能读写 /var/mobile 的进程）
+    writePlist(d, kPullFile);
+    // 关键：写进目标 App 自己的沙盒，只有它自己读得到
+    NSString *c = containerForBundle(bid);
+    if (!c) { LG(@"找不到 %@ 的数据容器，自取文件只能放全局", bid); return; }
+    NSString *docs = [c stringByAppendingPathComponent:@"Documents"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:docs withIntermediateDirectories:YES attributes:nil error:nil];
+    writePlist(d, [docs stringByAppendingPathComponent:@"wxchooser.pull.plist"]);
 }
 
 #pragma mark - 三种策略（都在子进程里跑）
 
-// 0) FrontBoard：用指定 App 打开指定链接
+// 0) SpringBoardServices：真正会把 URL 一起交给指定 App 的接口（FrontBoard 那边会把 URL 吃掉）
+static BOOL trySBSURL(NSString *bid, NSURL *url) {
+    if (!bid.length || !url) { LG(@"SBS 缺料"); return NO; }
+    dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_NOW);
+    typedef int (*SBSUrlLaunchFn)(CFStringRef, CFURLRef, CFDictionaryRef, CFStringRef *, Boolean);
+    SBSUrlLaunchFn fn = (SBSUrlLaunchFn)dlsym(RTLD_DEFAULT, "SBSLaunchApplicationWithIdentifierAndURLAndLaunchOptions");
+    if (!fn) { LG(@"策略0 没有 SBSLaunchApplicationWithIdentifierAndURLAndLaunchOptions"); return NO; }
+    NSDictionary *opts = @{ @"SBSOpenSensitiveURL": @YES, @"SBSOpenURLWithActivationOnLaunch": @YES };
+    int r = fn((__bridge CFStringRef)bid, (__bridge CFURLRef)url, (__bridge CFDictionaryRef)opts, NULL, false);
+    LG(@"策略0 SBS 返回=%d", r);
+    return r == 0;
+}
+
+// 1) FrontBoard：用指定 App 打开指定链接
 static BOOL tryFBURL(NSString *bid, NSURL *url) {
     id svc = FBSService();
     if (!svc || !url) { LG(@"策略0 缺料"); return NO; }
@@ -200,10 +238,13 @@ static int runTry(int which, NSString *reqPath) {
     NSString *us = req[@"url"] ?: @"";
     NSURL *url = us.length ? [NSURL URLWithString:us] : nil;
     LG(@"--try %d bid=%@ url=%@", which, bid, us.length ? us : @"(空)");
+    // 自己动手前先立牌子 + 写自取文件，免得 SpringBoard 把这记成「用户在跳微信」
+    markSelfLaunch(bid);
+    writePull(bid, us);
     BOOL ok = NO;
     NSString *how = @"";
-    if (which == 0) { ok = tryFBURL(bid, WeixinifyURL(url)); how = @"FBS+微信链接"; }
-    else if (which == 1) { ok = tryFBApp(bid, url); how = @"FBS原链接"; }
+    if (which == 0) { ok = trySBSURL(bid, WeixinifyURL(url)); how = @"SBS+微信链接"; }
+    else if (which == 1) { ok = tryFBURL(bid, WeixinifyURL(url)); how = @"FBS+微信链接"; }
     else if (which == 2) { ok = tryLSBundle(bid, url); how = @"LS按包名+自取"; }
     if (ok) { writeResult(reqPath, YES, how); return 0; }
     return 1;
