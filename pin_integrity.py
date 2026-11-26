@@ -13,15 +13,26 @@ MAGIC = b"WXPIN1"
 PIN_LEN = 64
 
 
+HEX = set(b"0123456789abcdefABCDEF")
+
+
 def locate(data: bytes) -> int:
-    idx = data.find(MAGIC)
-    if idx < 0:
-        raise SystemExit("未找到 WXPIN1 锚点，源码里 kWXIntegrityPin 丢了？")
-    start = idx + len(MAGIC)
-    slot = data[start:start + PIN_LEN]
-    if len(slot) != PIN_LEN:
-        raise SystemExit("锚点长度不足")
-    return start
+    """找锚点：后面跟 64 个十六进制字符、再跟一个 0 字节。
+    代码里可能还有一处 "WXPIN1" 字面量，靠这个条件排除掉。"""
+    candidates = []
+    i = data.find(MAGIC)
+    while i >= 0:
+        start = i + len(MAGIC)
+        slot = data[start:start + PIN_LEN]
+        term = data[start + PIN_LEN:start + PIN_LEN + 1]
+        if len(slot) == PIN_LEN and term == b"\x00" and all(c in HEX for c in slot):
+            candidates.append(start)
+        i = data.find(MAGIC, i + 1)
+    if not candidates:
+        raise SystemExit("未找到有效锚点（WXPIN1 + 64 位十六进制），源码里 kWXIntegrityPin 丢了？")
+    if len(candidates) > 1:
+        raise SystemExit(f"锚点候选不止一处：{candidates}")
+    return candidates[0]
 
 
 def compute(data: bytes, start: int) -> str:

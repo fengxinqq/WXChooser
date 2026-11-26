@@ -42,6 +42,14 @@ __attribute__((used)) static const char kWXIntegrityPin[] =
 static BOOL gWXPinChecked = NO;
 static BOOL gWXPinOK = NO;
 
+static BOOL WXHex64(const unsigned char *p) {
+    for (int i = 0; i < 64; i++) {
+        unsigned char c = p[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return NO;
+    }
+    return YES;
+}
+
 static BOOL WXSelfIntegrityOK(void) {
     if (gWXPinChecked) return gWXPinOK;
     gWXPinChecked = YES;
@@ -61,12 +69,28 @@ static BOOL WXSelfIntegrityOK(void) {
         NSMutableData *md = [data mutableCopy];
         unsigned char *bytes = (unsigned char *)md.mutableBytes;
         NSUInteger len = md.length;
-        if (off + 70 > len || memcmp(bytes + off, "WXPIN1", 6) != 0) {
-            WXLOG(@"★ 完整性校验：锚点位置异常，功能停用");
+
+        // 先按指针换算定位；不放心再按文件内容扫一遍（代码里另有一处 "WXPIN1" 字面量）
+        NSUInteger slot = NSNotFound;
+        if (off + 70 <= len && memcmp(bytes + off, "WXPIN1", 6) == 0
+            && WXHex64(bytes + off + 6) && bytes[off + 70] == 0) {
+            slot = off + 6;
+        }
+        if (slot == NSNotFound) {
+            for (NSUInteger k = 0; k + 70 <= len; k++) {
+                if (memcmp(bytes + k, "WXPIN1", 6) == 0 && WXHex64(bytes + k + 6) && bytes[k + 70] == 0) {
+                    slot = k + 6;
+                    break;
+                }
+            }
+        }
+        if (slot == NSNotFound || slot + 64 > len) {
+            WXLOG(@"★ 完整性校验：文件里找不到锚点，功能停用");
             return NO;
         }
+
         char pinned[65];
-        memcpy(pinned, bytes + off + 6, 64);
+        memcpy(pinned, bytes + slot, 64);
         pinned[64] = 0;
         BOOL placeholder = YES;
         for (int i = 0; i < 64; i++) { if (pinned[i] != '0') { placeholder = NO; break; } }
@@ -74,7 +98,7 @@ static BOOL WXSelfIntegrityOK(void) {
             WXLOG(@"★ 完整性校验：锚点未构建（全 0），功能停用");
             return NO;
         }
-        memset(bytes + off + 6, 0, 64);
+        memset(bytes + slot, 0, 64);
         unsigned char dg[CC_SHA256_DIGEST_LENGTH];
         CC_SHA256(bytes, (CC_LONG)len, dg);
         NSMutableString *hex = [NSMutableString stringWithCapacity:64];
