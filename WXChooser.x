@@ -1198,13 +1198,28 @@ static WXLaunchRunner *gWXRunner = nil;
 @end
 
 static void WXLaunchChosen(NSURL *url, NSDictionary *cand, NSDictionary *options, void (^completion)(BOOL)) {
-    WXPostLaunchingNote();
-    WXLaunchRunner *r = [[WXLaunchRunner alloc] init];
-    r.url = url;
-    r.cand = cand;
-    r.options = options;
-    r.completion = completion;
-    [r start];
+    // 回到 1.32 的做法：不发广播、不调私有启动接口、不拉外部程序，只把链接交给系统
+    NSString *bid = cand[@"bid"];
+    NSString *scheme = cand[@"scheme"];
+    BOOL isWebURL = !WXIsWeixinScheme(url.scheme ?: @"");
+    WXLOG(@"选择后按 1.32 方式打开 target=%@ url=%@ scheme=%@", bid ?: @"(空)", url.absoluteString ?: @"(空)", scheme ?: @"(无)");
+
+    BOOL fired = NO;
+    @try {
+        if (!isWebURL && scheme.length) {
+            fired = WXOpenByScheme(url, scheme, ^(BOOL ok) {
+                WXLOG(@"系统打开回调 ok=%d", ok);
+                if (completion) completion(YES);
+            });
+        }
+    } @catch (NSException *e) { WXLOG(@"改写 scheme 异常 %@", e.reason); fired = NO; }
+
+    if (!fired) {
+        WXLOG(@"改写 scheme 未生效，改为原样交给系统");
+        WXOpenPassthrough(url, options, ^(BOOL ok) {
+            if (completion) completion(YES);
+        });
+    }
 }
 
 static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDictionary *options, void (^completion)(BOOL)) {
