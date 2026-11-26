@@ -890,6 +890,8 @@ static void WXStyleAction(UIAlertAction *a, NSDictionary *cand, NSString *title)
 @interface WXSheetRowTarget : NSObject
 - (void)onRowTap:(UIButton *)sender;
 - (void)onCancelTap:(UIButton *)sender;
+- (void)onPressDown:(UIButton *)sender;
+- (void)onPressUp:(UIButton *)sender;
 - (void)dismissSheet;
 @end
 
@@ -909,7 +911,20 @@ static WXSheetRowTarget *gWXSheetTarget = nil;
     if (!c) return;
     [UIView animateWithDuration:0.16 animations:^{ c.alpha = 0.0; } completion:^(BOOL finished) { [c removeFromSuperview]; }];
 }
+- (void)onPressDown:(UIButton *)sender {
+    // 按下立刻整条变色：让手指一碰就有反馈，不会误以为是点到了取消
+    if (sender.tag == -999) { sender.alpha = 0.55; return; }
+    sender.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.09];
+}
+- (void)onPressUp:(UIButton *)sender {
+    sender.alpha = 1.0;
+    if (sender.tag != -999) sender.backgroundColor = [UIColor clearColor];
+}
 - (void)onRowTap:(UIButton *)sender {
+    @try {
+        UIImpactFeedbackGenerator *fb = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+        [fb prepare]; [fb impactOccurred];
+    } @catch (NSException *e) {}
     NSInteger idx = sender.tag;
     NSArray *cands = gWXSheetCands;
     void (^pick)(NSDictionary *) = gWXSheetPick;
@@ -992,6 +1007,10 @@ static BOOL WXShowSheet(UIView *host, NSArray<NSDictionary *> *cands, void (^pic
             row.frame = CGRectMake(0, y, cardW, rowH);
             row.tag = (NSInteger)i;
             [row addTarget:target action:@selector(onRowTap:) forControlEvents:UIControlEventTouchUpInside];
+            [row addTarget:target action:@selector(onPressDown:) forControlEvents:UIControlEventTouchDown];
+            [row addTarget:target action:@selector(onPressUp:)
+             forControlEvents:(UIControlEventTouchUpInside | UIControlEventTouchUpOutside
+                             | UIControlEventTouchCancel | UIControlEventTouchDragExit)];
 
             UIImage *icon = WXRealIconForBid(cand[@"bid"], cand[@"path"]);
             NSString *nm = cand[@"name"] ?: cand[@"bid"];
@@ -1037,7 +1056,12 @@ static BOOL WXShowSheet(UIView *host, NSArray<NSDictionary *> *cands, void (^pic
         [cancelBtn setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
         cancelBtn.backgroundColor = [UIColor secondarySystemBackgroundColor];
         cancelBtn.layer.cornerRadius = 14.0;
+        cancelBtn.tag = -999;
         [cancelBtn addTarget:target action:@selector(onCancelTap:) forControlEvents:UIControlEventTouchUpInside];
+        [cancelBtn addTarget:target action:@selector(onPressDown:) forControlEvents:UIControlEventTouchDown];
+        [cancelBtn addTarget:target action:@selector(onPressUp:)
+          forControlEvents:(UIControlEventTouchUpInside | UIControlEventTouchUpOutside
+                          | UIControlEventTouchCancel | UIControlEventTouchDragExit)];
         [container addSubview:cancelBtn];
 
         gWXSheetContainer = container;
