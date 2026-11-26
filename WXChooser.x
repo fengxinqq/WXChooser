@@ -490,15 +490,176 @@ static void WXWatchLaunchResult(NSString *dir, NSString *bid) {
         NSDictionary *res = [NSDictionary dictionaryWithContentsOfFile:resPath];
         if (![res isKindOfClass:[NSDictionary class]]) {
             WXLOG(@"启动器无回执（%@）", bid);
-            WXToast(@"没打开：启动器没响应");
+            WXToast(@"没打开：没收到回执");
+            return;
+        }
+        NSString *how = res[@"how"] ?: @"";
+        if ([how isEqualToString:@"退回原生"]) {
+            WXLOG(@"回执：只拉开了原生");
+            WXToast(@"分身没拉起来，已退回原生");
             return;
         }
         if ([res[@"ok"] boolValue]) {
-            WXLOG(@"启动器回执 成功（%@）", res[@"how"]);
+            WXLOG(@"启动器回执 成功（%@）", how);
         } else {
             WXLOG(@"启动器回执 失败（%@）", res[@"how"]);
             WXToast([NSString stringWithFormat:@"没打开（%@）", res[@"how"] ?: @"全败"]);
         }
+    });
+}
+
+#pragma mark - SpringBoard 内实际执行启动（后台线程，不碰主线程、不碰剪贴板）
+
+static id WXClassFrom(NSString *cls, NSArray *paths) {
+    Class c = NSClassFromString(cls);
+    if (c) return c;
+    for (NSString *p in paths) {
+        void *h = dlopen(p.UTF8String, RTLD_NOW);
+        if (!h) continue;
+        c = NSClassFromString(cls);
+        if (c) return c;
+    }
+    return nil;
+}
+
+static id WXFBSService(void) {
+    static id svc = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        id c = WXClassFrom(@"FBSSystemService", @[
+            @"/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices",
+            @"/System/Library/PrivateFrameworks/FrontBoard.framework/FrontBoard"]);
+        SEL s = sel_getUid("sharedService");
+        if (c && [c respondsToSelector:s]) svc = ((id (*)(id, SEL))objc_msgSend)(c, s);
+        WXLOG(@"SB: FBSSystemService=%@", svc ? @"有" : @"无");
+    });
+    return svc;
+}
+
+static BOOL WXWait(NSString *name, double timeout, BOOL (^blk)(void)) {
+    __block BOOL ok = NO;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            @try { ok = blk() ? YES : NO; }
+            @catch (NSException *e) { WXLOG(@"%@ 异常 %@", name, e.reason); ok = NO; }
+            dispatch_semaphore_signal(sem);
+        }
+    });
+    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC))) != 0) {
+        WXLOG(@"%@ 超时 %.1fs", name, timeout);
+        return NO;
+    }
+    WXLOG(@"%@ -> %@", name, ok ? @"成" : @"败");
+    return ok;
+}
+
+static BOOL WXSBOpenURLForApp(NSString *bid, NSURL *url) {
+    id svc = WXFBSService();
+    if (!svc || !url) return NO;
+    SEL s = sel_getUid("openURL:application:options:clientPort:withResult:");
+    if (![svc respondsToSelector:s]) { WXLOG(@"SB: FBS openURL:application: 不存在"); return NO; }
+    __block BOOL done = NO;
+    NSMutableDictionary *opts = [NSMutableDictionary dictionary];
+    @try { opts[@"FBSOpenApplicationOptionKeyPayloadURL"] = url; } @catch (NSException *e) {}
+    ((void (*)(id, SEL, id, id, id, unsigned, id))objc_msgSend)(svc, s, url, bid, opts, 0, ^(id e) {
+        done = YES;
+        WXLOG(@"SB: FBS+URL 回调 err=%@", e ? [e description] : @"无");
+    });
+    return WXWait(@"SB FBS+URL", 3.0, ^{ return done; });
+}
+
+static BOOL WXSBOpenAppWithURL(NSString *bid, NSURL *url) {
+    id svc = WXFBSService();
+    SEL s = sel_getUid("openApplication:options:withResult:");
+    if (!svc || ![svc respondsToSelector:s]) { WXLOG(@"SB: FBS openApplication 不存在"); return NO; }
+    __block BOOL done = NO;
+    NSMutableDictionary *opts = [NSMutableDictionary dictionary];
+    if (url) {
+        @try { opts[@"FBSOpenApplicationOptionKeyPayloadURL"] = url; } @catch (NSException *e) {}
+        @try { opts[@"FBSOpenApplicationOptionKeyLaunchURL"] = url; } @catch (NSException *e) {}
+    }
+    ((void (*)(id, SEL, id, id, id))objc_msgSend)(svc, s, bid, opts, ^(id e, id r) {
+        done = YES;
+        WXLOG(@"SB: FBS 按包名回调 err=%@", e ? [e description] : @"无");
+    });
+    return WXWait(@"SB FBS 按包名", 3.0, ^{ return done; });
+}
+
+static BOOL WXSBOpenViaSBS(NSString *bid, NSURL *url) {
+    if (!bid.length) return NO;
+    WXLoadSBS();
+    if (gSBSLaunchWithURL) {
+        CFStringRef eb = NULL;
+        int r = gSBSLaunchWithURL((__bridge CFStringRef)bid, (__bridge CFURLRef)url, NULL, &eb, false);
+        WXLOG(@"SB: SBS 带链接 r=%d err=%@", r, eb ? (__bridge NSString *)eb : @"无");
+        if (eb) CFRelease(eb);
+        if (r == 0) return YES;
+    }
+    if (gSBSLaunch) {
+        int r = gSBSLaunch((__bridge CFStringRef)bid, false);
+        WXLOG(@"SB: SBS 只启动 r=%d", r);
+        if (r == 0) return YES;
+    }
+    return NO;
+}
+
+static NSDictionary *WXNewestRequest(NSString **outPath) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray *cands = [NSMutableArray arrayWithObject:@"/var/mobile/wxchooser_req.plist"];
+    NSString *apps = @"/var/mobile/Containers/Data/Application";
+    for (NSString *d in [fm contentsOfDirectoryAtPath:apps error:nil]) {
+        [cands addObject:[apps stringByAppendingPathComponent:[d stringByAppendingPathComponent:@"Documents/wxreq.plist"]]];
+    }
+    NSString *bestPath = nil;
+    double bestTs = 0;
+    NSDictionary *best = nil;
+    for (NSString *p in cands) {
+        NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:p];
+        if (![dict isKindOfClass:[NSDictionary class]]) continue;
+        double ts = [[fm attributesOfItemAtPath:p error:nil][NSFileModificationDate] timeIntervalSince1970];
+        if (ts > bestTs) { bestTs = ts; best = dict; bestPath = p; }
+    }
+    if (!best) return nil;
+    if ([[NSDate date] timeIntervalSince1970] - bestTs > 90) return nil;
+    if (outPath) *outPath = bestPath;
+    return best;
+}
+
+static void WXSBHandleLaunchRequest(void) {
+    @autoreleasepool {
+        NSString *path = nil;
+        NSDictionary *req = WXNewestRequest(&path);
+        if (!req) { WXLOG(@"SB: 收工，没有找到启动请求"); return; }
+        NSString *bid = req[@"bid"] ?: @"";
+        NSString *us = req[@"url"] ?: @"";
+        NSURL *url = us.length ? [NSURL URLWithString:us] : nil;
+        WXLOG(@"SB: 收到启动请求 bid=%@ url=%@", bid, us.length ? us : @"(空)");
+        [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+        if (!bid.length) return;
+
+        NSString *how = @"";
+        BOOL ok = NO;
+        if (!ok && WXSBOpenURLForApp(bid, url)) { ok = YES; how = @"FBS+链接"; }
+        if (!ok && WXSBOpenAppWithURL(bid, url)) { ok = YES; how = @"FBS按包名"; }
+        if (!ok && WXSBOpenViaSBS(bid, url)) { ok = YES; how = @"SBS"; }
+        if (!ok && url) {
+            // 最后保底：按系统默认打开，至少把支付接上（会落到原生微信，提示里会写明）
+            [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+            ok = YES; how = @"退回原生";
+        }
+        WXLOG(@"SB: 结论 %@ (%@)", ok ? @"成功" : @"失败", how.length ? how : @"全败");
+        NSDictionary *res = @{ @"ok": @(ok), @"how": how ?: @"", @"ts": @([[NSDate date] timeIntervalSince1970]) };
+        NSString *rp = [[path stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"wxres.plist"];
+        NSData *resData = [NSPropertyListSerialization dataWithPropertyList:res format:NSPropertyListXMLFormat_v1_0 options:0 error:nil];
+        BOOL wr = [resData writeToFile:rp atomically:YES];
+        WXLOG(@"SB: 回执写入 %@ =%d", rp, wr);
+    }
+}
+
+static void WXSBLaunchReqCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef info) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        WXSBHandleLaunchRequest();
     });
 }
 
@@ -1613,24 +1774,6 @@ static void WXLSAsyncOpen(NSString *bid, NSURL *url) {
     } @catch (NSException *e) { WXLOG(@"LS 异步拉起异常 %@", e.reason); }
 }
 
-// SpringBoard 顺手拉起常驻启动器（不带参数 = 守护模式）；launchd 已经起过就算了
-static void WXSpawnOpenerDaemon(void) {
-    @try {
-        NSString *bin = WXOpenerPath();
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if (!bin.length || ![fm isExecutableFileAtPath:bin]) {
-            WXLOG(@"常驻启动器不可执行：%@", bin ?: @"(空)");
-            return;
-        }
-        const char *path = bin.UTF8String;
-        char *const argsv[] = { (char *)path, NULL };
-        char *const envv[] = { (char *)"PATH=/usr/bin:/bin:/usr/sbin:/sbin", (char *)"HOME=/var/mobile", NULL };
-        pid_t pid = 0;
-        int rc = posix_spawn(&pid, path, NULL, NULL, argsv, envv);
-        WXLOG(@"拉起常驻启动器 %@ rc=%d errno=%d pid=%d", bin, rc, errno, (int)pid);
-    } @catch (NSException *e) { WXLOG(@"拉常驻启动器异常 %@", e.reason); }
-}
-
 static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
     @try {
         if (!bid.length) return NO;
@@ -2263,10 +2406,10 @@ __attribute__((constructor)) static void WXInit(void) {
                                         WXSBCallback, CFSTR("com.fengxin.wxchooser.sblaunch"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         WXLoadSBS();
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        WXSBLaunchReqCallback, CFSTR("com.fengxin.wxchooser.launchreq"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         WXLOG(@"SB: 已注册代办启动监听 + 报到监听");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            WXSpawnOpenerDaemon();
-        });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             WXInstallRouterHooks();
             WXInstallWorkspaceHook();
