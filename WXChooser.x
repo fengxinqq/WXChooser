@@ -34,6 +34,7 @@ static void WXWriteLog(NSString *line) {
 static void (*o_sbmw_execute)(id, SEL, id, unsigned long long, id) = NULL;
 
 static volatile BOOL gWXBusy = NO;
+static volatile CFAbsoluteTime gWXBusyAt = 0;
 static volatile BOOL gWXDialoging = NO;
 static CFAbsoluteTime gWXCooldownUntil = 0;
 static NSString *gWXLastWXURL = nil;
@@ -312,7 +313,7 @@ static UIViewController *WXTopViewController(void) {
 }
 
 static void WXOpenPassthrough(NSURL *url, NSDictionary *options, void (^done)(BOOL)) {
-    gWXBusy = YES;
+    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (gWXBusy) { gWXBusy = NO; WXLOG(@"放行等待超时，解除忙碌标记"); }
     });
@@ -364,7 +365,7 @@ static BOOL WXOpenByBundleID(NSURL *url, NSString *bid, void (^done)(BOOL)) {
         if (![ws respondsToSelector:sel]) continue;
         @try {
             BOOL ok = NO;
-            gWXBusy = YES;
+            gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
             if ([sn hasSuffix:@"allowUnlock:"]) {
                 ok = ((BOOL (*)(id, SEL, id, id, BOOL))objc_msgSend)(ws, sel, url, bid, YES);
             } else {
@@ -942,8 +943,9 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
                 BOOL handled = NO;
                 NSString *scheme = cand[@"scheme"];
                 NSString *bid = cand[@"bid"];
+                BOOL isWebURL = !WXIsWeixinScheme(url.scheme ?: @"");
                 if (bid.length) handled = WXOpenByBundleID(url, bid, nil);
-                if (!handled && scheme.length) handled = WXOpenByScheme(url, scheme, ^(BOOL ok) {
+                if (!handled && !isWebURL && scheme.length) handled = WXOpenByScheme(url, scheme, ^(BOOL ok) {
                     if (!ok) WXLOG(@"scheme 方式打开失败：%@", scheme);
                 });
                 if (!handled) handled = WXRequestSpringBoardLaunch(url, cand[@"bid"]);
@@ -952,6 +954,7 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
                     WXLOG(@"几种方式都失败，回退系统默认，目标=%@", cand[@"bid"]);
                     WXOpenPassthrough(url, options, completion);
                 } else if (completion) {
+                    gWXBusy = NO;
                     completion(YES);
                 }
             }, ^{
@@ -977,8 +980,9 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
             BOOL handled = NO;
             NSString *scheme = cand[@"scheme"];
             NSString *bid = cand[@"bid"];
+            BOOL isWebURL = !WXIsWeixinScheme(url.scheme ?: @"");
             if (bid.length) handled = WXOpenByBundleID(url, bid, nil);
-            if (!handled && scheme.length) handled = WXOpenByScheme(url, scheme, ^(BOOL ok) {
+            if (!handled && !isWebURL && scheme.length) handled = WXOpenByScheme(url, scheme, ^(BOOL ok) {
                 if (!ok) WXLOG(@"scheme 方式打开失败：%@", scheme);
             });
             if (!handled) handled = WXRequestSpringBoardLaunch(url, cand[@"bid"]);
@@ -987,6 +991,7 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
                 WXLOG(@"几种方式都失败，回退系统默认，目标=%@", cand[@"bid"]);
                 WXOpenPassthrough(url, options, completion);
             } else if (completion) {
+                gWXBusy = NO;
                 completion(YES);
             }
         }];
@@ -1005,7 +1010,11 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
 
 // 返回 YES 表示已经由本插件接管（调用方应直接返回成功）
 static BOOL WXTryIntercept(NSURL *url, NSDictionary *options, void (^completion)(BOOL), NSString *entry) {
-    if (gWXBusy) return NO;
+    if (gWXBusy) {
+        if (CFAbsoluteTimeGetCurrent() - gWXBusyAt < 1.5) return NO;
+        WXLOG(@"忙碌标记已过期，自动解除");
+        gWXBusy = NO;
+    }
     NSString *selfBid = WXSelfBundleID();
     BOOL inSpringBoard = [selfBid isEqualToString:@"com.apple.springboard"];
     WXLOG(@"[%@] 入口调用 App=%@ url=%@ opts=%@", entry, selfBid ?: @"(未知)", url.absoluteString ?: @"(无)", options ? [(NSDictionary *)options description] : @"(空)");
@@ -1017,10 +1026,8 @@ static BOOL WXTryIntercept(NSURL *url, NSDictionary *options, void (^completion)
         WXLOG(@"[%@] %@ //%@", entry, scheme.length ? scheme : @"(无)", host);
         if (WXIsSelfWeChat()) return NO;
         if (!WXIsTargetURL(url)) return NO;
-        if (!WXIsWeixinScheme(scheme)) {
-            WXLOG(@"★ 命中微信 https 链接（Universal Link），无法强制指定 App，仅记录：%@", url.absoluteString);
-            return NO;
-        }
+        BOOL webLink = !WXIsWeixinScheme(scheme);
+        if (webLink) WXLOG(@"命中微信 https/Universal Link，同样弹选择框：%@", url.absoluteString);
         NSArray *cands = WXCandidatesForURL(url);
         WXLOG(@"拦截 %@ 候选 %lu 个", url.absoluteString, (unsigned long)cands.count);
         for (NSDictionary *c in cands) WXLOG(@"  候选：%@ %@ scheme=%@ wxScheme=%@", c[@"bid"], c[@"name"], c[@"scheme"] ?: @"(无)", c[@"wxScheme"] ?: @"(无)");
@@ -1047,7 +1054,7 @@ static BOOL (*o_ext_openURL)(id, SEL, NSURL *, void (^)(BOOL)) = NULL;
 static BOOL h_app_openURL_opts(id self, SEL _cmd, NSURL *url, NSDictionary *opts, void (^cb)(BOOL)) {
     if (WXTryIntercept(url, opts, cb, @"UIApplication openURL:options:")) return YES;
     if (!o_app_openURL_opts) return NO;
-    gWXBusy = YES;
+    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
     BOOL r = o_app_openURL_opts(self, _cmd, url, opts, cb);
     gWXBusy = NO;
     return r;
@@ -1056,7 +1063,7 @@ static BOOL h_app_openURL_opts(id self, SEL _cmd, NSURL *url, NSDictionary *opts
 static BOOL h_app_openURL(id self, SEL _cmd, NSURL *url) {
     if (WXTryIntercept(url, @{}, nil, @"UIApplication openURL:")) return YES;
     if (!o_app_openURL) return NO;
-    gWXBusy = YES;
+    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
     BOOL r = o_app_openURL(self, _cmd, url);
     gWXBusy = NO;
     return r;
@@ -1065,7 +1072,7 @@ static BOOL h_app_openURL(id self, SEL _cmd, NSURL *url) {
 static BOOL h_app__openURL_opts(id self, SEL _cmd, NSURL *url, id opts) {
     if (WXTryIntercept(url, [opts isKindOfClass:[NSDictionary class]] ? opts : @{}, nil, @"UIApplication _openURL:options:")) return YES;
     if (!o_app__openURL_opts) return NO;
-    gWXBusy = YES;
+    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
     BOOL r = o_app__openURL_opts(self, _cmd, url, opts);
     gWXBusy = NO;
     return r;
@@ -1074,7 +1081,7 @@ static BOOL h_app__openURL_opts(id self, SEL _cmd, NSURL *url, id opts) {
 static BOOL h_lsw_openURL(id self, SEL _cmd, NSURL *url) {
     if (WXTryIntercept(url, @{}, nil, @"LSWorkspace openURL:")) return YES;
     if (!o_lsw_openURL) return NO;
-    gWXBusy = YES;
+    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
     BOOL r = o_lsw_openURL(self, _cmd, url);
     gWXBusy = NO;
     return r;
@@ -1083,7 +1090,7 @@ static BOOL h_lsw_openURL(id self, SEL _cmd, NSURL *url) {
 static BOOL h_lsw_openURL_opts(id self, SEL _cmd, NSURL *url, id opts) {
     if (WXTryIntercept(url, [opts isKindOfClass:[NSDictionary class]] ? opts : @{}, nil, @"LSWorkspace openURL:withOptions:")) return YES;
     if (!o_lsw_openURL_opts) return NO;
-    gWXBusy = YES;
+    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
     BOOL r = o_lsw_openURL_opts(self, _cmd, url, opts);
     gWXBusy = NO;
     return r;
@@ -1092,7 +1099,7 @@ static BOOL h_lsw_openURL_opts(id self, SEL _cmd, NSURL *url, id opts) {
 static BOOL h_lsw_openSensitive(id self, SEL _cmd, NSURL *url, id opts) {
     if (WXTryIntercept(url, [opts isKindOfClass:[NSDictionary class]] ? opts : @{}, nil, @"LSWorkspace openSensitiveURL:withOptions:")) return YES;
     if (!o_lsw_openSensitive) return NO;
-    gWXBusy = YES;
+    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
     BOOL r = o_lsw_openSensitive(self, _cmd, url, opts);
     gWXBusy = NO;
     return r;
@@ -1101,7 +1108,7 @@ static BOOL h_lsw_openSensitive(id self, SEL _cmd, NSURL *url, id opts) {
 static BOOL h_ext_openURL(id self, SEL _cmd, NSURL *url, void (^cb)(BOOL)) {
     if (WXTryIntercept(url, @{}, cb, @"NSExtensionContext openURL:")) return YES;
     if (!o_ext_openURL) return NO;
-    gWXBusy = YES;
+    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
     BOOL r = o_ext_openURL(self, _cmd, url, cb);
     gWXBusy = NO;
     return r;
@@ -1120,7 +1127,7 @@ static BOOL h_app_canOpenURL(id self, SEL _cmd, NSURL *url) {
 static BOOL h_lsw_openURL_bid(id self, SEL _cmd, NSURL *url, id bid) {
     if (WXTryIntercept(url, @{}, nil, [NSString stringWithFormat:@"LSWorkspace openURL:withBundleIdentifier: %@", bid])) return YES;
     if (!o_lsw_openURL_bid) return NO;
-    gWXBusy = YES;
+    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
     BOOL r = o_lsw_openURL_bid(self, _cmd, url, bid);
     gWXBusy = NO;
     return r;
@@ -1129,7 +1136,7 @@ static BOOL h_lsw_openURL_bid(id self, SEL _cmd, NSURL *url, id bid) {
 static BOOL h_lsw_openURL_bid_unlock(id self, SEL _cmd, NSURL *url, id bid, BOOL allow) {
     if (WXTryIntercept(url, @{}, nil, [NSString stringWithFormat:@"LSWorkspace openURL:withBundleIdentifier:allowUnlock: %@", bid])) return YES;
     if (!o_lsw_openURL_bid_unlock) return NO;
-    gWXBusy = YES;
+    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
     BOOL r = o_lsw_openURL_bid_unlock(self, _cmd, url, bid, allow);
     gWXBusy = NO;
     return r;
@@ -1248,8 +1255,8 @@ static void WXLSAsyncOpen(NSString *bid, NSURL *url) {
 static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
     @try {
         if (!bid.length) return NO;
-        gWXBusy = YES;
-        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 14.0;
+        gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
+        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 3.0;
 
         WXLOG(@"外部启动器接管 bid=%@ url=%@", bid, url.absoluteString ?: @"(无)");
 
