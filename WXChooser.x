@@ -42,6 +42,7 @@ static UIImage *WXAppIcon(NSString *bid);
 static UIImage *WXRealIconForBid(NSString *bid, NSString *path);
 static NSString *WXRealNameForBid(NSString *bid);
 static NSString *WXBundlePathForBid(NSString *bid);
+static BOOL WXLaunchBySBS(NSURL *url, NSString *bid);
 static NSString *WXNameFromAppPath(NSString *dir);
 static UIViewController *gWXHostVC = nil;
 static void WXSBHideOverlay(void);
@@ -395,6 +396,25 @@ static void WXLoadSBS(void) {
     WXLOG(@"SBS 接口：withURL=%@ launch=%@", gSBSLaunchWithURL ? @"有" : @"无", gSBSLaunch ? @"有" : @"无");
 }
 
+static BOOL WXLaunchBySBS(NSURL *url, NSString *bid) {
+    if (!bid.length) return NO;
+    WXLoadSBS();
+    if (!gSBSLaunchWithURL && !gSBSLaunch) return NO;
+    int err = -1;
+    @try {
+        if (gSBSLaunchWithURL) {
+            CFStringRef eb = NULL;
+            err = gSBSLaunchWithURL((__bridge CFStringRef)bid, (__bridge CFURLRef)url,
+                                    (__bridge CFDictionaryRef)@{}, &eb, false);
+            if (eb) WXLOG(@"SBS 启动错误：%@", (__bridge NSString *)eb);
+        } else {
+            err = gSBSLaunch((__bridge CFStringRef)bid, false);
+        }
+    } @catch (NSException *e) { WXLOG(@"SBS 启动异常 %@", e.reason); }
+    WXLOG(@"SBS 按包名启动 %@ -> %d", bid, err);
+    return err == 0;
+}
+
 static void WXHandleLaunchRequest(void) {
     NSString *path = @"/var/mobile/wxchooser_req.plist";
     NSDictionary *req = [NSDictionary dictionaryWithContentsOfFile:path];
@@ -726,6 +746,8 @@ static void WXStyleAction(UIAlertAction *a, NSDictionary *cand, NSString *title)
 #pragma mark - 自绘底部菜单（图标与名字整行居中）
 
 @interface WXSheetRowTarget : NSObject
+- (void)onRowTouchDown:(UIButton *)sender;
+- (void)onRowTouchUp:(UIButton *)sender;
 - (void)onRowTap:(UIButton *)sender;
 - (void)onCancelTap:(UIButton *)sender;
 - (void)dismissSheet;
@@ -747,7 +769,18 @@ static WXSheetRowTarget *gWXSheetTarget = nil;
     if (!c) return;
     [UIView animateWithDuration:0.16 animations:^{ c.alpha = 0.0; } completion:^(BOOL finished) { [c removeFromSuperview]; }];
 }
+- (void)onRowTouchDown:(UIButton *)sender {
+    [UIView animateWithDuration:0.08 animations:^{ sender.alpha = 0.45; }];
+}
+- (void)onRowTouchUp:(UIButton *)sender {
+    [UIView animateWithDuration:0.12 animations:^{ sender.alpha = 1.0; }];
+}
 - (void)onRowTap:(UIButton *)sender {
+    sender.alpha = 1.0;
+    @try {
+        UIImpactFeedbackGenerator *h = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+        [h prepare]; [h impactOccurred];
+    } @catch (NSException *e) { }
     NSInteger idx = sender.tag;
     NSArray *cands = gWXSheetCands;
     void (^pick)(NSDictionary *) = gWXSheetPick;
@@ -830,6 +863,8 @@ static BOOL WXShowSheet(UIView *host, NSArray<NSDictionary *> *cands, void (^pic
             row.frame = CGRectMake(0, y, cardW, rowH);
             row.tag = (NSInteger)i;
             [row addTarget:target action:@selector(onRowTap:) forControlEvents:UIControlEventTouchUpInside];
+            [row addTarget:target action:@selector(onRowTouchDown:) forControlEvents:UIControlEventTouchDown];
+            [row addTarget:target action:@selector(onRowTouchUp:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel | UIControlEventTouchDragExit];
 
             UIImage *icon = WXRealIconForBid(cand[@"bid"], cand[@"path"]);
             NSString *nm = cand[@"name"] ?: cand[@"bid"];
@@ -945,6 +980,7 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
                 NSString *bid = cand[@"bid"];
                 BOOL isWebURL = !WXIsWeixinScheme(url.scheme ?: @"");
                 if (bid.length) handled = WXOpenByBundleID(url, bid, nil);
+                if (!handled && bid.length) handled = WXLaunchBySBS(url, bid);
                 if (!handled && !isWebURL && scheme.length) handled = WXOpenByScheme(url, scheme, ^(BOOL ok) {
                     if (!ok) WXLOG(@"scheme 方式打开失败：%@", scheme);
                 });
@@ -982,6 +1018,7 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
             NSString *bid = cand[@"bid"];
             BOOL isWebURL = !WXIsWeixinScheme(url.scheme ?: @"");
             if (bid.length) handled = WXOpenByBundleID(url, bid, nil);
+            if (!handled && bid.length) handled = WXLaunchBySBS(url, bid);
             if (!handled && !isWebURL && scheme.length) handled = WXOpenByScheme(url, scheme, ^(BOOL ok) {
                 if (!ok) WXLOG(@"scheme 方式打开失败：%@", scheme);
             });
