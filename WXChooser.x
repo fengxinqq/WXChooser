@@ -423,6 +423,85 @@ static void WXPostNote(NSString *name) {
                                          (__bridge CFStringRef)name, NULL, NULL, true);
 }
 
+static BOOL gWXInSB = NO;
+
+// 把「目标包名 + 链接」写成请求文件，再敲一下常驻启动器（wxchooseropen），由它去启动。
+// 启动器是独立 root 进程：成不成都不影响本进程，不会闪退、不会卡死。
+static BOOL WXPostDaemonRequest(NSString *bid, NSURL *url, NSString *dir) {
+    if (!bid.length || !dir.length) return NO;
+    NSString *reqPath = [dir stringByAppendingPathComponent:@"wxreq.plist"];
+    NSString *resPath = [dir stringByAppendingPathComponent:@"wxres.plist"];
+    [[NSFileManager defaultManager] removeItemAtPath:resPath error:nil];
+    NSDictionary *req = @{@"bid": bid,
+                          @"url": url.absoluteString ?: @"",
+                          @"ts": @([[NSDate date] timeIntervalSince1970])};
+    BOOL ok = [req writeToFile:reqPath atomically:YES];
+    WXPostNote(@"com.fengxin.wxchooser.launchreq");
+    WXLOG(@"请求启动器 包名=%@ 写入=%@ (%d)", bid, reqPath, ok);
+    return ok;
+}
+
+static NSString *WXAppDocsDir(void) {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    return paths.count ? paths[0] : nil;
+}
+
+static void WXToast(NSString *text) {
+    if (!text.length) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            UIWindow *w = nil;
+            for (UIWindow *win in [[UIApplication sharedApplication] windows]) {
+                if (win.isKeyWindow) { w = win; break; }
+            }
+            if (!w) return;
+            UILabel *l = [[UILabel alloc] initWithFrame:CGRectZero];
+            l.text = text;
+            l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+            l.textColor = [UIColor whiteColor];
+            l.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.85];
+            l.textAlignment = NSTextAlignmentCenter;
+            l.numberOfLines = 0;
+            l.layer.cornerRadius = 10.0;
+            l.clipsToBounds = YES;
+            l.userInteractionEnabled = NO;
+            [l sizeToFit];
+            CGRect f = l.frame;
+            f.size.width += 28; f.size.height += 18;
+            f.origin.x = (w.bounds.size.width - f.size.width) / 2.0;
+            f.origin.y = w.bounds.size.height - f.size.height - 90;
+            l.frame = f;
+            l.alpha = 0;
+            [w addSubview:l];
+            [UIView animateWithDuration:0.2 animations:^{ l.alpha = 1.0; } completion:^(BOOL d1) {
+                [UIView animateWithDuration:0.3 delay:2.2 options:0 animations:^{ l.alpha = 0; } completion:^(BOOL d2) {
+                    [l removeFromSuperview];
+                }];
+            }];
+        } @catch (NSException *e) { WXLOG(@"提示异常 %@", e.reason); }
+    });
+}
+
+// 交给启动器之后，2.5 秒看一次回执，失败就明确告诉用户，而不是一片死寂
+static void WXWatchLaunchResult(NSString *dir, NSString *bid) {
+    if (!dir.length) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NSString *resPath = [dir stringByAppendingPathComponent:@"wxres.plist"];
+        NSDictionary *res = [NSDictionary dictionaryWithContentsOfFile:resPath];
+        if (![res isKindOfClass:[NSDictionary class]]) {
+            WXLOG(@"启动器无回执（%@）", bid);
+            WXToast(@"没打开：启动器没响应");
+            return;
+        }
+        if ([res[@"ok"] boolValue]) {
+            WXLOG(@"启动器回执 成功（%@）", res[@"how"]);
+        } else {
+            WXLOG(@"启动器回执 失败（%@）", res[@"how"]);
+            WXToast([NSString stringWithFormat:@"没打开（%@）", res[@"how"] ?: @"全败"]);
+        }
+    });
+}
+
 static void WXTel(NSString *code) {
     WXLOG(@"遥测 %@", code);
     WXPostNote([NSString stringWithFormat:@"com.fengxin.wxchooser.tel.%@", code]);
@@ -1214,19 +1293,31 @@ static WXLaunchRunner *gWXRunner = nil;
 static void WXLaunchChosen(NSURL *url, NSDictionary *cand, NSDictionary *options, void (^completion)(BOOL)) {
     NSString *bid = cand[@"bid"];
     NSString *scheme = cand[@"scheme"];
-    WXLOG(@"选择后原样交给系统 target=%@ url=%@", bid ?: @"(空)", url.absoluteString ?: @"(空)");
+    BOOL isNative = [bid isEqualToString:@"com.tencent.xin"];
+    WXLOG(@"选择 %@ (%@) 在SB=%d url=%@", cand[@"name"], bid, gWXInSB, url.absoluteString ?: @"(空)");
 
-    WXOpenPassthrough(url, options, ^(BOOL ok) {
-        WXLOG(@"原样打开结果=%d", ok);
-        if (!ok && scheme.length) {
-            WXOpenByScheme(url, scheme, ^(BOOL ok2) {
-                WXLOG(@"改写后打开结果=%d", ok2);
-                if (completion) completion(YES);
-            });
-            return;
-        }
-        if (completion) completion(YES);
-    });
+    // 原生微信：就在当前进程原样打开（1.32 里真正能打开的就是这一下）
+    if (!gWXInSB && isNative) {
+        WXOpenPassthrough(url, options, ^(BOOL ok) {
+            WXLOG(@"原样打开结果=%d", ok);
+            if (!ok && scheme.length) {
+                WXOpenByScheme(url, scheme, ^(BOOL ok2) {
+                    WXLOG(@"改写后打开结果=%d", ok2);
+                    if (completion) completion(YES);
+                });
+                return;
+            }
+            if (completion) completion(YES);
+        });
+        return;
+    }
+
+    // 分身 / SpringBoard 内：交给常驻 root 启动器按包名拉起来
+    NSString *dir = gWXInSB ? @"/var/mobile" : WXAppDocsDir();
+    BOOL posted = WXPostDaemonRequest(bid, url, dir);
+    if (!posted) WXLOG(@"请求文件没写成功，只能先回成功让流程继续");
+    if (!gWXInSB) WXWatchLaunchResult(dir, bid);
+    if (completion) completion(YES);
 }
 
 static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDictionary *options, void (^completion)(BOOL)) {
@@ -1665,8 +1756,8 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                     WXSBHideOverlay();
                     NSURL *u2 = url;
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                        WXLOG(@"后台线程开始拉起 %@", bid);
-                        WXSBLaunchByBundle(u2, bid);
+                        WXLOG(@"后台线程请求启动器拉起 %@", bid);
+                        WXPostDaemonRequest(bid, u2, @"/var/mobile");
                     });
                 }, ^{
                     WXLOG(@"用户取消(自绘)");
@@ -1689,8 +1780,8 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                     WXSBHideOverlay();
                     NSURL *u2 = url;
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                        WXLOG(@"后台线程开始拉起 %@", bid);
-                        WXSBLaunchByBundle(u2, bid);
+                        WXLOG(@"后台线程请求启动器拉起 %@", bid);
+                        WXPostDaemonRequest(bid, u2, @"/var/mobile");
                     });
                 }];
                 WXStyleAction(act, cand, nm);
@@ -2078,6 +2169,7 @@ static void WXInstallRouterHooks(void) {
 }
 
 __attribute__((constructor)) static void WXInit(void) {
+    gWXInSB = [WXSelfBundleID() isEqualToString:@"com.apple.springboard"];
     WXLOG(@"LOADED in %@ (%@)", WXSelfBundleID(), WXIsSelfWeChat() ? @"微信本体" : @"其他进程");
     WXInstallHooks();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
