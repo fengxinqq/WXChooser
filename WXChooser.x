@@ -963,6 +963,29 @@ static double WXAppSheetAge(void) {
     } @catch (NSException *e) { return 9999.0; }
 }
 
+static void WXLaunchChosen(NSURL *url, NSDictionary *cand, NSDictionary *options, void (^completion)(BOOL)) {
+    NSString *bid = cand[@"bid"];
+    NSString *scheme = cand[@"scheme"];
+    BOOL isWebURL = !WXIsWeixinScheme(url.scheme ?: @"");
+    BOOL handled = NO;
+    if (bid.length) handled = WXOpenByBundleID(url, bid, nil);
+    if (!handled && bid.length) handled = WXLaunchBySBS(url, bid);
+    if (!handled && !isWebURL && scheme.length) {
+        handled = WXOpenByScheme(url, scheme, ^(BOOL ok) { if (!ok) WXLOG(@"scheme 方式打开失败：%@", scheme); });
+    }
+    if (!handled && bid.length) {
+        WXLOG(@"按包名带 URL 都失败，改为只打开 App：%@", bid);
+        handled = WXLaunchBySBS(nil, bid);
+    }
+    if (!handled) {
+        WXLOG(@"所有指定方式都失败，回退系统默认打开，目标=%@", bid);
+        WXOpenPassthrough(url, options, completion);
+        return;
+    }
+    gWXBusy = NO;
+    if (completion) completion(YES);
+}
+
 static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDictionary *options, void (^completion)(BOOL)) {
     UIViewController *top = WXTopViewController();
     if (!top) { WXLOG(@"找不到顶层控制器，直接放行"); completion(YES); return; }
@@ -975,24 +998,7 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
             }
         }
         BOOL shown = hostWin ? WXShowSheet(hostWin, cands, ^(NSDictionary *cand) {
-                BOOL handled = NO;
-                NSString *scheme = cand[@"scheme"];
-                NSString *bid = cand[@"bid"];
-                BOOL isWebURL = !WXIsWeixinScheme(url.scheme ?: @"");
-                if (bid.length) handled = WXOpenByBundleID(url, bid, nil);
-                if (!handled && bid.length) handled = WXLaunchBySBS(url, bid);
-                if (!handled && !isWebURL && scheme.length) handled = WXOpenByScheme(url, scheme, ^(BOOL ok) {
-                    if (!ok) WXLOG(@"scheme 方式打开失败：%@", scheme);
-                });
-                if (!handled) handled = WXRequestSpringBoardLaunch(url, cand[@"bid"]);
-                if (!handled) handled = WXOpenByBundleID(url, cand[@"bid"], nil);
-                if (!handled) {
-                    WXLOG(@"几种方式都失败，回退系统默认，目标=%@", cand[@"bid"]);
-                    WXOpenPassthrough(url, options, completion);
-                } else if (completion) {
-                    gWXBusy = NO;
-                    completion(YES);
-                }
+                WXLaunchChosen(url, cand, options, completion);
             }, ^{
                 if (completion) completion(NO);
             }) : NO;
@@ -1013,24 +1019,7 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
     for (NSDictionary *cand in cands) {
         NSString *title = cand[@"name"] ?: cand[@"bid"];
         UIAlertAction *act = [UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            BOOL handled = NO;
-            NSString *scheme = cand[@"scheme"];
-            NSString *bid = cand[@"bid"];
-            BOOL isWebURL = !WXIsWeixinScheme(url.scheme ?: @"");
-            if (bid.length) handled = WXOpenByBundleID(url, bid, nil);
-            if (!handled && bid.length) handled = WXLaunchBySBS(url, bid);
-            if (!handled && !isWebURL && scheme.length) handled = WXOpenByScheme(url, scheme, ^(BOOL ok) {
-                if (!ok) WXLOG(@"scheme 方式打开失败：%@", scheme);
-            });
-            if (!handled) handled = WXRequestSpringBoardLaunch(url, cand[@"bid"]);
-            if (!handled) handled = WXOpenByBundleID(url, cand[@"bid"], nil);
-            if (!handled) {
-                WXLOG(@"几种方式都失败，回退系统默认，目标=%@", cand[@"bid"]);
-                WXOpenPassthrough(url, options, completion);
-            } else if (completion) {
-                gWXBusy = NO;
-                completion(YES);
-            }
+            WXLaunchChosen(url, cand, options, completion);
         }];
         WXStyleAction(act, cand, title);
         [ac addAction:act];
