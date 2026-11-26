@@ -905,6 +905,13 @@ static BOOL WXShowSheet(UIView *host, NSArray<NSDictionary *> *cands, void (^pic
         [UIView animateWithDuration:0.20 animations:^{ container.alpha = 1.0; }];
         ok = YES;
         WXLOG(@"自绘底部菜单已显示，候选 %lu 个", (unsigned long)cands.count);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (gWXSheetContainer == container && gWXSheetCands) {
+                WXLOG(@"菜单 10 秒无人操作，自动关闭");
+                WXSheetRowTarget *t = gWXSheetTarget;
+                if (t) [t onCancelTap:nil];
+            }
+        });
     } @catch (NSException *e) {
         WXLOG(@"自绘菜单异常 %@", e.reason);
         ok = NO;
@@ -1937,6 +1944,15 @@ __attribute__((constructor)) static void WXInit(void) {
                                             NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         }
         WXLoadSBS();
+        for (NSString *f in @[@"/var/mobile/wxchooser_req.plist",
+                              @"/var/mobile/wxchooser_cmd.plist",
+                              @"/var/mobile/wxchooser.selflaunch.plist",
+                              @"/var/mobile/wxchooser.appsheet"]) {
+            if ([[NSFileManager defaultManager] fileExistsAtPath:f]) {
+                [[NSFileManager defaultManager] removeItemAtPath:f error:nil];
+                WXLOG(@"清理遗留状态文件 %@", f.lastPathComponent);
+            }
+        }
         WXLOG(@"SB: 已注册代办启动监听 + 报到监听");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             WXInstallRouterHooks();
