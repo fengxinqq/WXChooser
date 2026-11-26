@@ -67,6 +67,7 @@ static double WXAppSheetAge(void);
 static void WXMarkAppSheetShowing(void);
 static void WXRemoveSheetNow(void);
 static BOOL WXSBEnsureOverlay(void);
+static UIWindow *gWXOverlayWin;
 static BOOL WXSBInterceptURL(NSURL *url, NSString *entry);
 
 static NSString *WXSelfBundleID(void) {
@@ -1344,31 +1345,34 @@ static void WXSBHideOverlay(void) {
             [gWXHostVC dismissViewControllerAnimated:NO completion:nil];
         }
         gWXOverlayVisible = NO;
+        if (gWXOverlayWin) { gWXOverlayWin.hidden = YES; }
         WXLOG(@"SB 弹框已关闭");
     } @catch (NSException *e) {
         WXLOG(@"关闭弹框异常 %@", e.reason);
     }
 }
 
+static UIWindow *gWXOverlayWin = nil;
+
 static BOOL WXSBEnsureOverlay(void) {
-    if (gWXHostVC) return YES;
+    if (gWXHostVC && gWXOverlayWin) return YES;
     @try {
-        // 只用 SpringBoard 自己已有的窗口，绝不自建窗口、绝不挂 SystemAperture 场景
-        UIWindow *host = nil;
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (!w.hidden && w.rootViewController && w.windowLevel < UIWindowLevelAlert) { host = w; break; }
+        // 必须用能接收触摸的窗口：之前借 SpringBoard 的壁纸窗口（level=-3）根本点不动
+        if (!gWXOverlayWin) {
+            UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+            w.windowLevel = UIWindowLevelAlert + 1;
+            w.backgroundColor = [UIColor clearColor];
+            UIViewController *vc = [[UIViewController alloc] init];
+            vc.view.backgroundColor = [UIColor clearColor];
+            w.rootViewController = vc;
+            w.hidden = NO;
+            gWXOverlayWin = w;
+            gWXHostVC = vc;
+            WXLOG(@"SB 弹框宿主就绪 自建窗口 level=%.0f", w.windowLevel);
         }
-        if (!host) {
-            for (UIWindow *w in [UIApplication sharedApplication].windows) {
-                if (w.rootViewController && w.windowLevel < UIWindowLevelAlert) { host = w; break; }
-            }
-        }
-        if (!host) { WXLOG(@"SB 找不到承载窗口，放弃弹框"); return NO; }
-        gWXHostVC = host.rootViewController;
-        WXLOG(@"SB 弹框宿主就绪 %@ level=%.0f", NSStringFromClass([host class]), host.windowLevel);
         return gWXHostVC != nil;
     } @catch (NSException *e) {
-        WXLOG(@"找宿主异常 %@", e.reason);
+        WXLOG(@"建宿主窗口异常 %@", e.reason);
         return NO;
     }
 }
