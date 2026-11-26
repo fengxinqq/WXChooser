@@ -1,5 +1,5 @@
 # 把守护进程 plist 摆到 layout 里（仓库里只留根目录一份，避免网页上传目录结构）
-launchd-copy := $(shell echo ok)
+launchd-copy := $(shell mkdir -p layout/Library/LaunchDaemons && cp wxchooser-launchd.plist layout/Library/LaunchDaemons/com.fengxin.wxchooser.launchd.plist 2>/dev/null && echo ok)
 
 export TARGET = iphone:clang:latest:15.0
 export ARCHS = arm64e
