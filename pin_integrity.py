@@ -35,9 +35,51 @@ def locate(data: bytes) -> int:
     return candidates[0]
 
 
+LC_CODE_SIGNATURE = 0x1d
+
+
+def code_limit(data: bytes) -> int:
+    """哈希范围到 __LINKEDIT 的 fileoff 为止。这段是编译产物本身，
+    签名重写只动 __LINKEDIT 之后的部分，不会影响它。"""
+    try:
+        import struct
+        ncmds = struct.unpack("<I", data[16:20])[0]
+        off = 32
+        sig = None
+        for _ in range(ncmds):
+            cmd, cmdsize = struct.unpack("<II", data[off:off + 8])
+            if cmd == 0x19:  # LC_SEGMENT_64
+                name = data[off + 8:off + 24]
+                fileoff = struct.unpack("<Q", data[off + 40:off + 48])[0]
+                if name == b"__LINKEDIT" and fileoff > 0:
+                    return int(fileoff)
+            elif cmd == LC_CODE_SIGNATURE:
+                sig = struct.unpack("<I", data[off + 8:off + 12])[0]
+            off += cmdsize
+        if sig:
+            return int(sig)
+    except Exception:
+        pass
+    return len(data)
+
+
+def header_end(data: bytes) -> int:
+    """跳过 Mach-O 头与加载命令：重签名会改这里的段大小字段。"""
+    try:
+        import struct
+        sizeofcmds = struct.unpack("<I", data[20:24])[0]
+        return 32 + sizeofcmds
+    except Exception:
+        return 0
+
+
 def compute(data: bytes, start: int) -> str:
-    buf = bytearray(data)
-    buf[start:start + PIN_LEN] = b"0" * PIN_LEN
+    limit = code_limit(data)
+    hdr = header_end(data)
+    if hdr >= limit or start < hdr:
+        raise SystemExit("锚点落在头/签名区，检查代码位置")
+    buf = bytearray(data[hdr:limit])
+    buf[start - hdr:start - hdr + PIN_LEN] = b"0" * PIN_LEN
     return hashlib.sha256(bytes(buf)).hexdigest()
 
 

@@ -69,22 +69,42 @@ static BOOL WXSelfIntegrityOK(void) {
         NSMutableData *md = [data mutableCopy];
         unsigned char *bytes = (unsigned char *)md.mutableBytes;
         NSUInteger len = md.length;
+        // 只算到 __LINKEDIT（LC_CODE_SIGNATURE）为止：签名改写尾部不影响这份哈希
+        NSUInteger limit = len;
+        @try {
+            uint32_t ncmds = *(uint32_t *)(bytes + 16);
+            NSUInteger p = 32;
+            for (uint32_t i = 0; i < ncmds && p + 48 <= len; i++) {
+                uint32_t cmd = *(uint32_t *)(bytes + p);
+                uint32_t sz = *(uint32_t *)(bytes + p + 4);
+                if (cmd == 0x19 && p + 48 <= len) {   // __LINKEDIT 的 fileoff 之前是编译产物本身
+                    const char *nm = (const char *)(bytes + p + 8);
+                    if (strncmp(nm, "__LINKEDIT", 10) == 0) {
+                        uint64_t fo = *(uint64_t *)(bytes + p + 40);
+                        if (fo > 0 && fo <= len) { limit = (NSUInteger)fo; break; }
+                    }
+                }
+                if (sz < 8) break;
+                p += sz;
+            }
+        } @catch (NSException *e) { limit = len; }
+        if (limit == 0 || limit > len) limit = len;
 
         // 先按指针换算定位；不放心再按文件内容扫一遍（代码里另有一处 "WXPIN1" 字面量）
         NSUInteger slot = NSNotFound;
-        if (off + 70 <= len && memcmp(bytes + off, "WXPIN1", 6) == 0
+        if (off + 70 <= limit && memcmp(bytes + off, "WXPIN1", 6) == 0
             && WXHex64(bytes + off + 6) && bytes[off + 70] == 0) {
             slot = off + 6;
         }
         if (slot == NSNotFound) {
-            for (NSUInteger k = 0; k + 70 <= len; k++) {
+            for (NSUInteger k = 0; k + 70 <= limit; k++) {
                 if (memcmp(bytes + k, "WXPIN1", 6) == 0 && WXHex64(bytes + k + 6) && bytes[k + 70] == 0) {
                     slot = k + 6;
                     break;
                 }
             }
         }
-        if (slot == NSNotFound || slot + 64 > len) {
+        if (slot == NSNotFound || slot + 64 > limit) {
             WXLOG(@"★ 完整性校验：文件里找不到锚点，功能停用");
             return NO;
         }
@@ -98,14 +118,20 @@ static BOOL WXSelfIntegrityOK(void) {
             WXLOG(@"★ 完整性校验：锚点未构建（全 0），功能停用");
             return NO;
         }
+        NSUInteger hdr = 0;
+        @try { hdr = 32 + (NSUInteger)(*(uint32_t *)(bytes + 20)); } @catch (NSException *e) { hdr = 0; }
+        if (hdr == 0 || hdr >= limit || slot < hdr) {
+            WXLOG(@"★ 完整性校验：哈希范围异常，功能停用");
+            return NO;
+        }
         memset(bytes + slot, 0, 64);
         unsigned char dg[CC_SHA256_DIGEST_LENGTH];
-        CC_SHA256(bytes, (CC_LONG)len, dg);
+        CC_SHA256(bytes + hdr, (CC_LONG)(limit - hdr), dg);
         NSMutableString *hex = [NSMutableString stringWithCapacity:64];
         for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) [hex appendFormat:@"%02x", dg[i]];
         NSString *expect = [[NSString stringWithUTF8String:pinned] lowercaseString];
         gWXPinOK = [hex isEqualToString:expect];
-        if (gWXPinOK) WXLOG(@"完整性校验通过（%lu 字节）", (unsigned long)len);
+        if (gWXPinOK) WXLOG(@"完整性校验通过（%lu 字节）", (unsigned long)limit);
         else WXLOG(@"★ 完整性校验失败：dylib 被改过，功能已停用（期望 %@ 实得 %@）", expect, hex);
     } @catch (NSException *e) {
         WXLOG(@"★ 完整性校验异常 %@，功能停用", e.reason);
