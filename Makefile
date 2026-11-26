@@ -26,7 +26,9 @@ STAGED_DYLIB = $(THEOS_STAGING_DIR)/Library/MobileSubstrate/DynamicLibraries/WXC
 before-package::
 	@echo "==> 写入完整性锚点"
 	python3 $(THEOS_PROJECT_DIR)/pin_integrity.py "$(STAGED_DYLIB)"
-	ldid -S "$(STAGED_DYLIB)"
+	@echo "codesign=[$(TARGET_CODESIGN)] allocate=[$(TARGET_CODESIGN_ALLOCATE)] flags=[$(TARGET_CODESIGN_FLAGS)]"
+	@test -n "$(TARGET_CODESIGN_ALLOCATE)" || (echo "!! CODESIGN_ALLOCATE 为空，拒绝签名，否则 arm64e 会被写坏" && exit 1)
+	CODESIGN_ALLOCATE="$(TARGET_CODESIGN_ALLOCATE)" $(TARGET_CODESIGN) $(TARGET_CODESIGN_FLAGS) "$(STAGED_DYLIB)"
 	python3 $(THEOS_PROJECT_DIR)/pin_integrity.py "$(STAGED_DYLIB)"
 	python3 $(THEOS_PROJECT_DIR)/pin_integrity.py "$(STAGED_DYLIB)" --verify
 
