@@ -1,0 +1,36 @@
+name: build15i8
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: fetch sources
+        run: |
+          curl -fsSL https://aka.doubaocdn.com/s/6nqbpy0bNU -o WXChooser.x
+          curl -fsSL https://aka.doubaocdn.com/s/Ug8xiSCIWN -o control
+          curl -fsSL https://aka.doubaocdn.com/s/yEU9W8ANU4 -o Makefile
+      - name: deps
+        run: brew install ldid xz dpkg
+      - name: theos
+        run: |
+          git clone --recursive --depth 1 https://github.com/roothide/theos ~/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          echo "$HOME/theos/bin" >> $GITHUB_PATH
+      - name: sdk
+        run: |
+          curl -sL https://github.com/theos/sdks/archive/master.tar.gz -o /tmp/sdks.tgz
+          mkdir -p ~/theos/sdks && tar xzf /tmp/sdks.tgz -C ~/theos/sdks --strip-components=1
+      - name: build
+        run: make clean package FINALPACKAGE=1 _THEOS_PLATFORM_DPKG_DEB=dpkg-deb THEOS_PLATFORM_DEB_COMPRESSION_TYPE=xz
+      - name: release deb
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          gh release create "w4${GITHUB_RUN_NUMBER}" packages/*.deb --title "w4${GITHUB_RUN_NUMBER}" --notes "auto build" --target main
