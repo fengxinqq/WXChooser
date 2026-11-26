@@ -68,6 +68,7 @@ static void WXSBHideOverlay(void);
 static CFAbsoluteTime gWXSuppressUntil = 0;
 static void WXPostSheetDismiss(void);
 static void WXPostLaunchingNote(void);
+static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid);
 static double WXAppSheetAge(void);
 static void WXMarkAppSheetShowing(void);
 static void WXRemoveSheetNow(void);
@@ -509,6 +510,10 @@ static void WXHandleSBLaunchFromPasteboard(void) {
     NSString *us = parts[2];
     NSURL *u = us.length ? [NSURL URLWithString:us] : nil;
     WXLOG(@"SB: 代为启动 bid=%@ url=%@", bid, us);
+    // 用 1.32 验证过的那条路：由 SpringBoard 拉起外部启动器，按包名打开
+    BOOL helperOk = NO;
+    @try { helperOk = WXSBLaunchByBundle(u, bid); } @catch (NSException *e) { WXLOG(@"SB: 外部启动器异常 %@", e.reason); }
+    WXLOG(@"SB: 外部启动器结果=%d", helperOk);
     WXLoadSBS();
     int r = -1;
     @try {
@@ -1026,7 +1031,7 @@ static void WXRemoveSheetNow(void) {
 
 static void WXLaunchingCallback(CFNotificationCenterRef center, void *observer, CFNotificationName name, const void *object, CFDictionaryRef info) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 8.0;
+        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 1.5;
         gWXDialoging = NO;
         gWXCooldownUntil = 0;
         WXLOG(@"收到启动广播，SB 放行 8 秒且不再弹框");
@@ -1216,6 +1221,7 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
         BOOL shown = hostWin ? WXShowSheet(hostWin, cands, ^(NSDictionary *cand) {
                 WXLaunchChosen(url, cand, options, completion);
             }, ^{
+                gWXBusy = NO; gWXBusyAt = 0;
                 if (completion) completion(NO);
             }) : NO;
         if (shown) {
@@ -1253,7 +1259,7 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
 // 返回 YES 表示已经由本插件接管（调用方应直接返回成功）
 static BOOL WXTryIntercept(NSURL *url, NSDictionary *options, void (^completion)(BOOL), NSString *entry) {
     if (gWXBusy) {
-        if (CFAbsoluteTimeGetCurrent() - gWXBusyAt < 1.5) return NO;
+        if (CFAbsoluteTimeGetCurrent() - gWXBusyAt < 0.6) return NO;
         WXLOG(@"忙碌标记已过期，自动解除");
         gWXBusy = NO;
     }
@@ -1498,7 +1504,7 @@ static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
     @try {
         if (!bid.length) return NO;
         gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
-        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 3.0;
+        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 1.0;
 
         WXLOG(@"外部启动器接管 bid=%@ url=%@", bid, url.absoluteString ?: @"(无)");
 
@@ -1633,7 +1639,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                     NSString *bid = cand[@"bid"];
                     WXLOG(@"用户选择(自绘)：%@ (%@)", cand[@"name"], bid);
                     gWXDialoging = NO;
-                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 2.5;
+                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 0.5;
                     WXSBHideOverlay();
                     NSURL *u2 = url;
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -1643,7 +1649,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                 }, ^{
                     WXLOG(@"用户取消(自绘)");
                     gWXDialoging = NO;
-                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 2.5;
+                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 0.5;
                     WXSBHideOverlay();
                 })) {
                 WXSetGuard(NO);
@@ -1657,7 +1663,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                 UIAlertAction *act = [UIAlertAction actionWithTitle:nm style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
                     WXLOG(@"用户选择：%@ (%@)", nm, bid);
                     gWXDialoging = NO;
-                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 2.5;
+                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 0.5;
                     WXSBHideOverlay();
                     NSURL *u2 = url;
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -1671,7 +1677,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
             [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
                 WXLOG(@"用户取消");
                 gWXDialoging = NO;
-                gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 2.5;
+                gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 0.5;
                 WXSBHideOverlay();
             }]];
             [gWXHostVC presentViewController:ac animated:NO completion:^{
