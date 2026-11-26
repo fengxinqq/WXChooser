@@ -1418,8 +1418,19 @@ static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
         WXLOG(@"外部启动器接管 bid=%@ url=%@", bid, url.absoluteString ?: @"(无)");
 
         NSMutableArray *paths = [NSMutableArray array];
+        [paths addObject:@"/usr/libexec/wxchooseropen"];   // 1.71 起启动器改放这里，DynamicLibraries 保持干净
         NSString *selfPath = WXOpenerPath();
-        if (selfPath) [paths addObject:selfPath];
+        if (selfPath) {
+            [paths addObject:selfPath];                      // 兼容旧安装位置
+            // 用自身路径反推真实根（roothide 下可能是 .jbroot-xxx/usr/lib/TweakInject/...）
+            NSString *dir = [selfPath stringByDeletingLastPathComponent];
+            if ([dir hasSuffix:@"/usr/lib/TweakInject"]) {
+                NSString *root = [dir stringByDeletingLastPathComponent];
+                root = [root stringByDeletingLastPathComponent];
+                root = [root stringByDeletingLastPathComponent];
+                [paths addObject:[root stringByAppendingPathComponent:@"usr/libexec/wxchooseropen"]];
+            }
+        }
         [paths addObject:@"/usr/bin/wxchooseropen"];
         NSFileManager *fm = [NSFileManager defaultManager];
         NSString *bin = nil;
