@@ -1,0 +1,38 @@
+name: build15i
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: brew install ldid xz dpkg
+      - name: theos
+        run: |
+          git clone --recursive --depth 1 https://github.com/roothide/theos ~/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          echo "$HOME/theos/bin" >> $GITHUB_PATH
+      - name: sdk
+        run: |
+          curl -sL https://github.com/theos/sdks/archive/master.tar.gz -o /tmp/sdks.tgz
+          mkdir -p ~/theos/sdks && tar xzf /tmp/sdks.tgz -C ~/theos/sdks --strip-components=1
+      - name: build
+        run: make clean all FINALPACKAGE=1 _THEOS_PLATFORM_DPKG_DEB=dpkg-deb THEOS_PLATFORM_DEB_COMPRESSION_TYPE=xz
+      - name: pin integrity
+        run: |
+          set -e
+          DYLIB=$(find .theos -name WXChooser.dylib -type f | head -1)
+          echo "dylib: $DYLIB"
+          python3 tools/pin_integrity.py "$DYLIB" --verify || python3 tools/pin_integrity.py "$DYLIB"
+          ldid -S "$DYLIB"
+          python3 tools/pin_integrity.py "$DYLIB" --verify
+      - name: package
+        run: |
+          set -e
+          make package FINALPACKAGE=1 _THEOS_PLATFORM_DPKG_DEB=dpkg-deb THEOS_PLATFORM_DEB_COMPRESSION_TYPE=xz
+          STAGED=.theos/_/Library/MobileSubstrate/DynamicLibraries/WXChooser.dylib
+          python3 tools/pin_integrity.py "$STAGED" --verify
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WXChooser-deb15i
+          path: packages/*.deb

@@ -31,6 +31,65 @@ static void WXWriteLog(NSString *line) {
 
 #define WXLOG(...) WXWriteLog([NSString stringWithFormat:__VA_ARGS__])
 
+#import <CommonCrypto/CommonDigest.h>
+
+// 1.65 完整性锚点：构建时由 tools/pin_integrity.py 把这 64 位填成
+// 「将这 64 字节归零后整个 dylib 的 SHA-256」。被改动过就对不上。
+// 首次构建时这里是 64 个 0，此时一律按「校验失败」处理（功能不生效）。
+__attribute__((used)) static const char kWXIntegrityPin[] =
+    "WXPIN1" "0000000000000000000000000000000000000000000000000000000000000000";
+
+static BOOL gWXPinChecked = NO;
+static BOOL gWXPinOK = NO;
+
+static BOOL WXSelfIntegrityOK(void) {
+    if (gWXPinChecked) return gWXPinOK;
+    gWXPinChecked = YES;
+    gWXPinOK = NO;
+    @try {
+        Dl_info info; memset(&info, 0, sizeof(info));
+        if (!dladdr((void *)&kWXIntegrityPin, &info) || !info.dli_fbase || !info.dli_fname) {
+            WXLOG(@"★ 完整性校验：拿不到自身镜像信息，功能停用");
+            return NO;
+        }
+        NSUInteger off = (NSUInteger)((uintptr_t)kWXIntegrityPin - (uintptr_t)info.dli_fbase);
+        NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:info.dli_fname]];
+        if (!data.length) {
+            WXLOG(@"★ 完整性校验：读不到自身文件 %s，功能停用", info.dli_fname);
+            return NO;
+        }
+        NSMutableData *md = [data mutableCopy];
+        unsigned char *bytes = (unsigned char *)md.mutableBytes;
+        NSUInteger len = md.length;
+        if (off + 70 > len || memcmp(bytes + off, "WXPIN1", 6) != 0) {
+            WXLOG(@"★ 完整性校验：锚点位置异常，功能停用");
+            return NO;
+        }
+        char pinned[65];
+        memcpy(pinned, bytes + off + 6, 64);
+        pinned[64] = 0;
+        BOOL placeholder = YES;
+        for (int i = 0; i < 64; i++) { if (pinned[i] != '0') { placeholder = NO; break; } }
+        if (placeholder) {
+            WXLOG(@"★ 完整性校验：锚点未构建（全 0），功能停用");
+            return NO;
+        }
+        memset(bytes + off + 6, 0, 64);
+        unsigned char dg[CC_SHA256_DIGEST_LENGTH];
+        CC_SHA256(bytes, (CC_LONG)len, dg);
+        NSMutableString *hex = [NSMutableString stringWithCapacity:64];
+        for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) [hex appendFormat:@"%02x", dg[i]];
+        NSString *expect = [[NSString stringWithUTF8String:pinned] lowercaseString];
+        gWXPinOK = [hex isEqualToString:expect];
+        if (gWXPinOK) WXLOG(@"完整性校验通过（%lu 字节）", (unsigned long)len);
+        else WXLOG(@"★ 完整性校验失败：dylib 被改过，功能已停用（期望 %@ 实得 %@）", expect, hex);
+    } @catch (NSException *e) {
+        WXLOG(@"★ 完整性校验异常 %@，功能停用", e.reason);
+        gWXPinOK = NO;
+    }
+    return gWXPinOK;
+}
+
 static void (*o_sbmw_execute)(__unsafe_unretained id, SEL, __unsafe_unretained id, unsigned long long, __unsafe_unretained id) = NULL;
 
 static volatile BOOL gWXBusy = NO;
@@ -1025,6 +1084,7 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
 
 // 返回 YES 表示已经由本插件接管（调用方应直接返回成功）
 static BOOL WXTryIntercept(NSURL *url, NSDictionary *options, void (^completion)(BOOL), NSString *entry) {
+    if (!WXSelfIntegrityOK()) return NO;
     if (WXIsBusyNow()) return NO;
     NSString *selfBid = WXSelfBundleID();
     BOOL inSpringBoard = [selfBid isEqualToString:@"com.apple.springboard"];
@@ -1374,6 +1434,7 @@ static BOOL WXSBEnsureOverlay(void) {
 }
 
 static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void)) {
+    if (!WXSelfIntegrityOK()) { if (fallback) fallback(); return; }
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             NSURL *probe = url ?: [NSURL URLWithString:@"weixin://"];
@@ -1472,6 +1533,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
 }
 
 static BOOL h_router_openURL(__unsafe_unretained id self, SEL _cmd, __unsafe_unretained NSURL *url) {
+    if (!WXSelfIntegrityOK()) return o_router_openURL ? o_router_openURL(self, _cmd, url) : NO;
     @try {
         WXLOG(@"[HFOpenURLRouter openURL:] %@", url.absoluteString);
         if (WXSelfLaunchAge() < 8.0) {
@@ -1490,6 +1552,7 @@ static BOOL h_router_openURL(__unsafe_unretained id self, SEL _cmd, __unsafe_unr
 }
 
 static BOOL h_router_openSensitive(__unsafe_unretained id self, SEL _cmd, __unsafe_unretained NSURL *url) {
+    if (!WXSelfIntegrityOK()) return o_router_openSensitive ? o_router_openSensitive(self, _cmd, url) : NO;
     @try {
         WXLOG(@"[HFOpenURLRouter openSensitiveURL:] %@", url.absoluteString);
         if (WXSelfLaunchAge() < 8.0) {
@@ -1681,6 +1744,10 @@ static NSString *WXWeixinURLFromString(NSString *s) {
 }
 
 static void h_sbmw_execute(__unsafe_unretained id self, SEL _cmd, __unsafe_unretained id request, unsigned long long options, __unsafe_unretained id validator) {
+    if (!WXSelfIntegrityOK()) {
+        if (o_sbmw_execute) o_sbmw_execute(self, _cmd, request, options, validator);
+        return;
+    }
     CFAbsoluteTime nowWX = CFAbsoluteTimeGetCurrent();
     if (gWXOverlayVisible && gWXOverlaySince > 0 && nowWX - gWXOverlaySince > 12.0) {
         WXLOG(@"上次弹框挂了 %.0f 秒没关，先清掉", nowWX - gWXOverlaySince);
