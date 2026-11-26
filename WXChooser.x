@@ -853,7 +853,7 @@ static BOOL WXShowSheet(UIView *host, NSArray<NSDictionary *> *cands, void (^pic
 
             UIImage *icon = WXRealIconForBid(cand[@"bid"], cand[@"path"]);
             NSString *nm = cand[@"name"] ?: cand[@"bid"];
-            UIFont *nf = [UIFont systemFontOfSize:17 weight:UIFontWeightMedium];
+            UIFont *nf = [UIFont systemFontOfSize:17];   // 原生常规字重，不加粗
             CGFloat tw = [nm sizeWithAttributes:@{NSFontAttributeName:nf}].width + 2.0;
             CGFloat iconW = icon ? 26.0 : 0.0;
             CGFloat spacing = icon ? 10.0 : 0.0;
@@ -873,7 +873,7 @@ static BOOL WXShowSheet(UIView *host, NSArray<NSDictionary *> *cands, void (^pic
             UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(gx, 0, tw, rowH)];
             lab.text = nm;
             lab.font = nf;
-            lab.textColor = [UIColor systemBlueColor];
+            lab.textColor = [UIColor labelColor];   // 原生正文色，不加颜色
             lab.userInteractionEnabled = NO;
             [row addSubview:lab];
 
