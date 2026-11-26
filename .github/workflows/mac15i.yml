@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: macos-15-intel
@@ -21,17 +23,12 @@ jobs:
           mkdir -p ~/theos/sdks && tar xzf /tmp/sdks.tgz -C ~/theos/sdks --strip-components=1
       - name: build
         run: make clean package FINALPACKAGE=1 _THEOS_PLATFORM_DPKG_DEB=dpkg-deb THEOS_PLATFORM_DEB_COMPRESSION_TYPE=xz
-      - name: publish deb to dist branch
+      - name: release deb
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          git config user.name github-actions
-          git config user.email github-actions@users.noreply.github.com
-          mkdir -p dist
-          cp packages/*.deb dist/
-          git checkout -B dist
-          git add -f dist
-          git commit -m "deb run ${GITHUB_RUN_NUMBER}" || true
-          git push -f origin dist
+          gh release create "v${GITHUB_RUN_NUMBER}" packages/*.deb --title "v${GITHUB_RUN_NUMBER}" --notes "auto build" --target main
       - uses: actions/upload-artifact@v4
         with:
           name: WXChooser-deb15i-${{ github.run_number }}
