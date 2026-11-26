@@ -46,7 +46,9 @@ static BOOL WXLaunchBySBS(NSURL *url, NSString *bid);
 static NSString *WXNameFromAppPath(NSString *dir);
 static UIViewController *gWXHostVC = nil;
 static void WXSBHideOverlay(void);
+static CFAbsoluteTime gWXSuppressUntil = 0;
 static void WXPostSheetDismiss(void);
+static void WXPostLaunchingNote(void);
 static double WXAppSheetAge(void);
 static void WXMarkAppSheetShowing(void);
 static void WXRemoveSheetNow(void);
@@ -941,6 +943,23 @@ static void WXRemoveSheetNow(void) {
     if (c) [c removeFromSuperview];
 }
 
+static void WXLaunchingCallback(CFNotificationCenterRef center, void *observer, CFNotificationName name, const void *object, CFDictionaryRef info) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 8.0;
+        gWXDialoging = NO;
+        gWXCooldownUntil = 0;
+        WXLOG(@"收到启动广播，SB 放行 8 秒且不再弹框");
+        WXSBHideOverlay();
+    });
+}
+
+static void WXPostLaunchingNote(void) {
+    @try {
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                             CFSTR("com.fengxin.wxchooser.launching"), NULL, NULL, true);
+    } @catch (NSException *e) { }
+}
+
 static void WXSheetDismissCallback(CFNotificationCenterRef center, void *observer, CFNotificationName name, const void *object, CFDictionaryRef info) {
     dispatch_async(dispatch_get_main_queue(), ^{
         WXRemoveSheetNow();
@@ -966,24 +985,52 @@ static double WXAppSheetAge(void) {
 static void WXLaunchChosen(NSURL *url, NSDictionary *cand, NSDictionary *options, void (^completion)(BOOL)) {
     NSString *bid = cand[@"bid"];
     NSString *scheme = cand[@"scheme"];
+    WXPostLaunchingNote();
     BOOL isWebURL = !WXIsWeixinScheme(url.scheme ?: @"");
+    NSMutableString *steps = [NSMutableString string];
     BOOL handled = NO;
-    if (bid.length) handled = WXOpenByBundleID(url, bid, nil);
-    if (!handled && bid.length) handled = WXLaunchBySBS(url, bid);
+
+    BOOL r1 = bid.length ? WXOpenByBundleID(url, bid, nil) : NO;
+    [steps appendFormat:@"1 按包名+链接 %d\n", r1];
+    if (r1) handled = YES;
+
+    BOOL r2 = NO;
+    if (!handled && bid.length) { r2 = WXLaunchBySBS(url, bid); handled = r2; }
+    if (!handled) [steps appendFormat:@"2 系统SBS+链接 %d\n", r2];
+
+    BOOL r3 = NO;
     if (!handled && !isWebURL && scheme.length) {
-        handled = WXOpenByScheme(url, scheme, ^(BOOL ok) { if (!ok) WXLOG(@"scheme 方式打开失败：%@", scheme); });
+        r3 = WXOpenByScheme(url, scheme, ^(BOOL ok) { if (!ok) WXLOG(@"scheme 方式打开失败：%@", scheme); });
+        handled = r3;
     }
-    if (!handled && bid.length) {
-        WXLOG(@"按包名带 URL 都失败，改为只打开 App：%@", bid);
-        handled = WXLaunchBySBS(nil, bid);
-    }
+    if (!handled && !isWebURL) [steps appendFormat:@"3 改链接 %@ %d\n", scheme ?: @"(无)", r3];
+
+    BOOL r4 = NO;
+    if (!handled && bid.length) { r4 = WXLaunchBySBS(nil, bid); handled = r4; }
+    if (!handled && bid.length) [steps appendFormat:@"4 仅启动App %d\n", r4];
+
     if (!handled) {
-        WXLOG(@"所有指定方式都失败，回退系统默认打开，目标=%@", bid);
+        [steps appendString:@"5 回退系统默认"];
         WXOpenPassthrough(url, options, completion);
-        return;
+    } else {
+        gWXBusy = NO;
+        if (completion) completion(YES);
     }
-    gWXBusy = NO;
-    if (completion) completion(YES);
+
+    // 1.5 秒后自检：还留在前台说明没跳走，把每一步结果弹出来
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+        WXLOG(@"自检：仍在当前应用，弹窗提示诊断结果");
+        UIViewController *top = WXTopViewController();
+        if (!top) return;
+        NSString *msg = [NSString stringWithFormat:@"目标 %@\n链接 %@\n%@", bid ?: @"(空)",
+                         url.absoluteString ?: @"(空)", steps];
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"没跳转到微信"
+                                                                   message:msg
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
+        [top presentViewController:ac animated:YES completion:nil];
+    });
 }
 
 static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDictionary *options, void (^completion)(BOOL)) {
@@ -1211,7 +1258,7 @@ static UIWindow *gWXOverlay = nil;
 static volatile BOOL gWXOverlayVisible = NO;
 static NSString *const kWXGuard = @"/var/mobile/wxchooser.guard";
 static BOOL gWXGuardTripped = NO;
-static CFAbsoluteTime gWXSuppressUntil = 0;
+
 static id gWXPendingReq = nil;
 static id gWXPendingSelf = nil;
 static id gWXPendingValidator = nil;
@@ -1726,10 +1773,7 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
                 static CFAbsoluteTime lastHit = 0;
                 CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
                 BOOL tooSoon = (now - lastHit < 1.2);
-                double appAge = WXAppSheetAge();
-                BOOL appHandled = (appAge < 3.0);
-                BOOL busyByDialog = (gWXDialoging || now < gWXCooldownUntil || appHandled);
-                if (appHandled) WXLOG(@"应用内已弹窗（%.1f 秒前），SB 不再重复弹框", appAge);
+                BOOL busyByDialog = (gWXDialoging || now < gWXCooldownUntil);
                 if (busyByDialog) {
                     WXLOG(@"弹框进行中/刚选完，静默拒绝重复请求 url=%@", u.absoluteString ?: @"(无)");
                     if ([request respondsToSelector:NSSelectorFromString(@"declineWithReason:")]) {
@@ -1857,6 +1901,9 @@ __attribute__((constructor)) static void WXInit(void) {
         }
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                         WXDarwinCallback, CFSTR("com.fengxin.wxchooser.launch"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        WXLaunchingCallback, CFSTR("com.fengxin.wxchooser.launching"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         for (NSString *nm in @[@"com.fengxin.wxchooser.loaded.chinaunicom",
                                @"com.fengxin.wxchooser.loaded.umbra",
