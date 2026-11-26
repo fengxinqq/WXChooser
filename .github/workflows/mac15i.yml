@@ -20,5 +20,5 @@ jobs:
         run: make clean package FINALPACKAGE=1 _THEOS_PLATFORM_DPKG_DEB=dpkg-deb THEOS_PLATFORM_DEB_COMPRESSION_TYPE=xz
       - uses: actions/upload-artifact@v4
         with:
-          name: WXChooser-deb15i
+          name: WXChooser-deb15i-${{ github.run_number }}
           path: packages/*.deb
