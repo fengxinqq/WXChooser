@@ -4,6 +4,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <unistd.h>
+#import <sys/stat.h>
 #import <stdarg.h>
 #import <dispatch/dispatch.h>
 
@@ -91,6 +92,16 @@ static BOOL openViaFBSSystem(NSString *bid, NSURL *url) {
     return NO;
 }
 
+static NSString *const kSelfMark = @"/var/mobile/wxchooser.selflaunch.plist";
+
+// 立牌：告诉 SpringBoard「接下来这次启动是我们自己发的」，别拦、别弹
+static void markSelfLaunch(NSString *bid) {
+    NSDictionary *d = @{ @"bid": bid ?: @"", @"ts": @([[NSDate date] timeIntervalSince1970]) };
+    [d writeToFile:kSelfMark atomically:YES];
+    chmod([kSelfMark UTF8String], 0644);
+    LG(@"立自启动标记 bid=%@", bid);
+}
+
 int main(int argc, char **argv) {
     __block NSInteger r = -999;
     __block NSString *how = @"无";
@@ -111,10 +122,12 @@ int main(int argc, char **argv) {
         id ws = WSObj();
         LG(@"工作区=%@ FBS=%@", ws ? NSStringFromClass([ws class]) : @"(空)", FBSvc() ? @"有" : @"无");
 
+        markSelfLaunch(bid);
         BOOL useURLFirst = (url != nil);
 
         if (useURLFirst) {
             // 带 URL 的三条路先走：让微信直接进支付页
+            markSelfLaunch(bid);
             r = runWithTimeout(@"FBS+URL", 6.0, ^{ return openViaFBSSystem(bid, url); });
             if (r == 0) how = @"FBS+URL";
             if (r != 0) {
@@ -138,6 +151,7 @@ int main(int argc, char **argv) {
         }
 
         if (r != 0) {
+            markSelfLaunch(bid);
             r = runWithTimeout(@"FBS", 6.0, ^{ return openViaFBSSystem(bid, nil); });
             if (r == 0) how = @"FBS 系统服务";
         }

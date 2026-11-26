@@ -1458,11 +1458,27 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
     });
 }
 
+// 启动器发起的那次启动：看到标记就放行，不拦不弹
+static BOOL WXSelfLaunchPassThrough(NSString *bid) {
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/wxchooser.selflaunch.plist"];
+    if (![d isKindOfClass:[NSDictionary class]]) return NO;
+    double ts = [d[@"ts"] doubleValue];
+    NSString *mb = d[@"bid"];
+    double age = [[NSDate date] timeIntervalSince1970] - ts;
+    if (age < 0 || age > 10.0) { [[NSFileManager defaultManager] removeItemAtPath:@"/var/mobile/wxchooser.selflaunch.plist" error:nil]; return NO; }
+    BOOL match = (mb.length && bid.length) ? [mb isEqualToString:bid] : (age < 2.5);
+    if (!match) return NO;
+    [[NSFileManager defaultManager] removeItemAtPath:@"/var/mobile/wxchooser.selflaunch.plist" error:nil];
+    WXLOG(@"★ 放行本次自启动（启动器发起）：%@", mb);
+    return YES;
+}
+
 // SpringBoard 里的 URL 路由：微信热激活（已运行时）也走这里，必须在这里也弹
 static BOOL WXSBInterceptURL(NSURL *url, NSString *entry) {
     if (![url isKindOfClass:[NSURL class]]) return NO;
     if (!WXIsTargetURL(url)) return NO;
     if (WXIsSelfWeChat()) return NO;
+    if (WXSelfLaunchPassThrough(@"")) { WXLOG(@"SB 路由放行（自启动标记）"); return NO; }
     if (gWXOverlayVisible || gWXDialoging) { WXLOG(@"SB 路由重复命中（弹框已在），拦下不重复：%@", url.absoluteString); return YES; }
     if (CFAbsoluteTimeGetCurrent() < gWXSuppressUntil) { WXLOG(@"SB 路由命中但处于自启动放行窗口，放行：%@", url.absoluteString); return NO; }
     if (gWXGuardTripped) { WXLOG(@"SB 路由命中但护栏生效，放行"); return NO; }
@@ -1713,6 +1729,10 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
             BOOL urlLike = (u && WXIsTargetURL(u))
                         || (desc && [desc.lowercaseString containsString:@"weixin"])
                         || (u && WXIsWeChatWebURL(u));
+            if (looksWX && (urlLike || bidKnown) && WXSelfLaunchPassThrough(bid ?: @"")) {
+                WXLOG(@"事务放行（自启动标记）");
+                looksWX = NO; bidKnown = NO;
+            }
             if (looksWX && (urlLike || bidKnown)) {
                 if (!desc) { @try { desc = [request description]; } @catch (NSException *e) {} }
                 if (!u) {
