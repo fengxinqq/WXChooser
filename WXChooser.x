@@ -14,38 +14,19 @@
 
 static NSString *const kWXLogPath = @"/var/mobile/wxchooser.log";
 
-static NSString *WXLocalLogPath(void) {
-    @try {
-        NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        if (dir.length) return [dir stringByAppendingPathComponent:@"wxchooser.log"];
-    } @catch (NSException *e) { }
-    return nil;
-}
-
 static void WXWriteLog(NSString *line) {
     NSString *s = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], line];
-    BOOL wrote = NO;
     @try {
         NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kWXLogPath];
         if (!fh) {
-            wrote = [s writeToFile:kWXLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        } else {
-            [fh seekToEndOfFile];
-            [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]];
-            [fh closeFile];
-            wrote = YES;
+            [s writeToFile:kWXLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            return;
         }
-    } @catch (NSException *e) { wrote = NO; }
-    if (wrote) return;
-    NSString *lp = WXLocalLogPath();
-    if (!lp.length) return;
-    @try {
-        NSFileHandle *fh2 = [NSFileHandle fileHandleForWritingAtPath:lp];
-        if (!fh2) { [s writeToFile:lp atomically:YES encoding:NSUTF8StringEncoding error:nil]; return; }
-        [fh2 seekToEndOfFile];
-        [fh2 writeData:[s dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh2 closeFile];
-    } @catch (NSException *e) { }
+        [fh seekToEndOfFile];
+        [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } @catch (NSException *e) {
+    }
 }
 
 #define WXLOG(...) WXWriteLog([NSString stringWithFormat:__VA_ARGS__])
@@ -53,7 +34,6 @@ static void WXWriteLog(NSString *line) {
 static void (*o_sbmw_execute)(id, SEL, id, unsigned long long, id) = NULL;
 
 static volatile BOOL gWXBusy = NO;
-static volatile CFAbsoluteTime gWXBusyAt = 0;
 static volatile BOOL gWXDialoging = NO;
 static CFAbsoluteTime gWXCooldownUntil = 0;
 static NSString *gWXLastWXURL = nil;
@@ -61,14 +41,10 @@ static UIImage *WXAppIcon(NSString *bid);
 static UIImage *WXRealIconForBid(NSString *bid, NSString *path);
 static NSString *WXRealNameForBid(NSString *bid);
 static NSString *WXBundlePathForBid(NSString *bid);
-static BOOL WXLaunchBySBS(NSURL *url, NSString *bid);
 static NSString *WXNameFromAppPath(NSString *dir);
 static UIViewController *gWXHostVC = nil;
 static void WXSBHideOverlay(void);
-static CFAbsoluteTime gWXSuppressUntil = 0;
 static void WXPostSheetDismiss(void);
-static void WXPostLaunchingNote(void);
-static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid);
 static double WXAppSheetAge(void);
 static void WXMarkAppSheetShowing(void);
 static void WXRemoveSheetNow(void);
@@ -336,7 +312,7 @@ static UIViewController *WXTopViewController(void) {
 }
 
 static void WXOpenPassthrough(NSURL *url, NSDictionary *options, void (^done)(BOOL)) {
-    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
+    gWXBusy = YES;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (gWXBusy) { gWXBusy = NO; WXLOG(@"放行等待超时，解除忙碌标记"); }
     });
@@ -388,7 +364,7 @@ static BOOL WXOpenByBundleID(NSURL *url, NSString *bid, void (^done)(BOOL)) {
         if (![ws respondsToSelector:sel]) continue;
         @try {
             BOOL ok = NO;
-            gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
+            gWXBusy = YES;
             if ([sn hasSuffix:@"allowUnlock:"]) {
                 ok = ((BOOL (*)(id, SEL, id, id, BOOL))objc_msgSend)(ws, sel, url, bid, YES);
             } else {
@@ -416,214 +392,6 @@ static void WXLoadSBS(void) {
     gSBSLaunchWithURL = (int (*)(CFStringRef, CFURLRef, CFDictionaryRef, CFStringRef *, Boolean))dlsym(RTLD_DEFAULT, "SBSLaunchApplicationWithIdentifierAndURLAndLaunchOptions");
     gSBSLaunch = (int (*)(CFStringRef, Boolean))dlsym(RTLD_DEFAULT, "SBSLaunchApplicationWithIdentifier");
     WXLOG(@"SBS 接口：withURL=%@ launch=%@", gSBSLaunchWithURL ? @"有" : @"无", gSBSLaunch ? @"有" : @"无");
-}
-
-static void WXPostNote(NSString *name) {
-    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                                         (__bridge CFStringRef)name, NULL, NULL, true);
-}
-
-static BOOL gWXInSB = NO;
-
-// 把「目标包名 + 链接」写成请求文件，再敲一下常驻启动器（wxchooseropen），由它去启动。
-// 启动器是独立 root 进程：成不成都不影响本进程，不会闪退、不会卡死。
-static BOOL WXPostDaemonRequest(NSString *bid, NSURL *url, NSString *dir) {
-    if (!bid.length || !dir.length) return NO;
-    NSString *reqPath = [dir stringByAppendingPathComponent:@"wxreq.plist"];
-    NSString *resPath = [dir stringByAppendingPathComponent:@"wxres.plist"];
-    [[NSFileManager defaultManager] removeItemAtPath:resPath error:nil];
-    NSDictionary *req = @{@"bid": bid,
-                          @"url": url.absoluteString ?: @"",
-                          @"ts": @([[NSDate date] timeIntervalSince1970])};
-    BOOL ok = [req writeToFile:reqPath atomically:YES];
-    WXPostNote(@"com.fengxin.wxchooser.launchreq");
-    WXLOG(@"请求启动器 包名=%@ 写入=%@ (%d)", bid, reqPath, ok);
-    return ok;
-}
-
-static NSString *WXAppDocsDir(void) {
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    return paths.count ? paths[0] : nil;
-}
-
-static void WXToast(NSString *text) {
-    if (!text.length) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @try {
-            UIWindow *w = nil;
-            for (UIWindow *win in [[UIApplication sharedApplication] windows]) {
-                if (win.isKeyWindow) { w = win; break; }
-            }
-            if (!w) return;
-            UILabel *l = [[UILabel alloc] initWithFrame:CGRectZero];
-            l.text = text;
-            l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-            l.textColor = [UIColor whiteColor];
-            l.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.85];
-            l.textAlignment = NSTextAlignmentCenter;
-            l.numberOfLines = 0;
-            l.layer.cornerRadius = 10.0;
-            l.clipsToBounds = YES;
-            l.userInteractionEnabled = NO;
-            [l sizeToFit];
-            CGRect f = l.frame;
-            f.size.width += 28; f.size.height += 18;
-            f.origin.x = (w.bounds.size.width - f.size.width) / 2.0;
-            f.origin.y = w.bounds.size.height - f.size.height - 90;
-            l.frame = f;
-            l.alpha = 0;
-            [w addSubview:l];
-            [UIView animateWithDuration:0.2 animations:^{ l.alpha = 1.0; } completion:^(BOOL d1) {
-                [UIView animateWithDuration:0.3 delay:2.2 options:0 animations:^{ l.alpha = 0; } completion:^(BOOL d2) {
-                    [l removeFromSuperview];
-                }];
-            }];
-        } @catch (NSException *e) { WXLOG(@"提示异常 %@", e.reason); }
-    });
-}
-
-static void WXHandleResultDict(NSDictionary *res, NSString *bid) {
-    NSString *how = res[@"how"] ?: @"";
-    if ([how isEqualToString:@"退回原生"]) {
-        WXLOG(@"回执：只拉开了原生");
-        WXToast(@"分身没拉起来，已退回原生");
-        return;
-    }
-    if ([res[@"ok"] boolValue]) {
-        WXLOG(@"启动器回执 成功（%@）", how);
-    } else {
-        WXLOG(@"启动器回执 失败（%@）", how);
-        WXToast([NSString stringWithFormat:@"没打开（%@）", how.length ? how : @"全败"]);
-    }
-}
-
-// 交给启动器之后，先 2.5 秒看一次回执，还没有就再等 3 秒看第二次，别误报
-static void WXWatchLaunchResult(NSString *dir, NSString *bid) {
-    if (!dir.length) return;
-    NSString *resPath = [dir stringByAppendingPathComponent:@"wxres.plist"];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        NSDictionary *res = [NSDictionary dictionaryWithContentsOfFile:resPath];
-        if (![res isKindOfClass:[NSDictionary class]]) {
-            WXLOG(@"2.5 秒还没回执（%@），再等 3 秒", bid);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                NSDictionary *r2 = [NSDictionary dictionaryWithContentsOfFile:resPath];
-                if (![r2 isKindOfClass:[NSDictionary class]]) {
-                    WXLOG(@"启动器无回执（%@）", bid);
-                    WXToast(@"没打开：没收到回执");
-                    return;
-                }
-                WXHandleResultDict(r2, bid);
-            });
-            return;
-        }
-        WXHandleResultDict(res, bid);
-    });
-}
-
-#pragma mark - SpringBoard 只负责拉起守护进程（不再在 SpringBoard 里调私有启动接口）
-
-static NSString *WXOpenerPath(void);
-
-static NSDictionary *WXNewestRequest(NSString **outPath) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSMutableArray *cands = [NSMutableArray arrayWithObject:@"/var/mobile/wxchooser_req.plist"];
-    NSString *apps = @"/var/mobile/Containers/Data/Application";
-    for (NSString *d in [fm contentsOfDirectoryAtPath:apps error:nil]) {
-        [cands addObject:[apps stringByAppendingPathComponent:[d stringByAppendingPathComponent:@"Documents/wxreq.plist"]]];
-    }
-    NSString *bestPath = nil;
-    double bestTs = 0;
-    NSDictionary *best = nil;
-    for (NSString *p in cands) {
-        NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:p];
-        if (![dict isKindOfClass:[NSDictionary class]]) continue;
-        double ts = [[fm attributesOfItemAtPath:p error:nil][NSFileModificationDate] timeIntervalSince1970];
-        if (ts > bestTs) { bestTs = ts; best = dict; bestPath = p; }
-    }
-    if (!best) return nil;
-    if ([[NSDate date] timeIntervalSince1970] - bestTs > 90) return nil;
-    if (outPath) *outPath = bestPath;
-    return best;
-}
-
-static BOOL WXDaemonAlive(void) {
-    NSString *s = [NSString stringWithContentsOfFile:@"/var/mobile/wxchooser.daemon.pid" encoding:NSUTF8StringEncoding error:nil];
-    pid_t p = s.length ? (pid_t)s.intValue : 0;
-    return (p > 1 && kill(p, 0) == 0);
-}
-
-static BOOL WXSpawnDaemon(void) {
-    NSString *bin = WXOpenerPath();
-    if (!bin.length || ![[NSFileManager defaultManager] isExecutableFileAtPath:bin]) {
-        WXLOG(@"SB: 启动器不可用 %@", bin ?: @"(空)");
-        return NO;
-    }
-    const char *path = bin.UTF8String;
-    char *const argsv[] = { (char *)path, NULL };
-    char *const envv[] = { (char *)"PATH=/usr/bin:/bin:/usr/sbin:/sbin", (char *)"HOME=/var/mobile", NULL };
-    pid_t pid = 0;
-    int rc = posix_spawn(&pid, path, NULL, NULL, argsv, envv);
-    WXLOG(@"SB: spawn 守护 rc=%d errno=%d pid=%d (%@)", rc, errno, (int)pid, bin);
-    return rc == 0;
-}
-
-static void WXWriteFailResult(NSString *why) {
-    NSString *p = nil;
-    WXNewestRequest(&p);
-    if (!p.length) return;
-    NSDictionary *res = @{ @"ok": @NO, @"how": why ?: @"失败", @"ts": @([[NSDate date] timeIntervalSince1970]) };
-    NSData *data = [NSPropertyListSerialization dataWithPropertyList:res format:NSPropertyListXMLFormat_v1_0 options:0 error:nil];
-    [data writeToFile:[[p stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"wxres.plist"] atomically:YES];
-    WXLOG(@"SB: 已写入失败回执 %@", why);
-}
-
-static void WXSBLaunchReqCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef info) {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        @autoreleasepool {
-            if (WXDaemonAlive()) { WXLOG(@"SB: 守护在跑，让它去启动"); return; }
-            BOOL ok = WXSpawnDaemon();
-            usleep(900 * 1000);
-            if (!ok) WXWriteFailResult(@"守护起不来");
-            else if (!WXDaemonAlive()) WXWriteFailResult(@"守护起来就退了");
-        }
-    });
-}
-
-static void WXTel(NSString *code) {
-    WXLOG(@"遥测 %@", code);
-    WXPostNote([NSString stringWithFormat:@"com.fengxin.wxchooser.tel.%@", code]);
-}
-
-// 通过剪贴板把「目标包名 + 链接」交给 SpringBoard，由 SB 代为启动（SB 有权限，应用没有）
-static BOOL WXPostSBLaunch(NSString *bid, NSURL *url) {
-    if (!bid.length) return NO;
-    @try {
-        UIPasteboard *pb = [UIPasteboard generalPasteboard];
-        pb.string = [NSString stringWithFormat:@"WXREQ\x01%@\x01%@", bid, url.absoluteString ?: @""];
-    } @catch (NSException *e) {
-        WXLOG(@"写剪贴板异常 %@", e.reason);
-        return NO;
-    }
-    WXPostNote(@"com.fengxin.wxchooser.sblaunch");
-    WXLOG(@"已请求 SB 代为启动 bid=%@ url=%@", bid, url.absoluteString);
-    return YES;
-}
-
-static BOOL WXLaunchBySBS(NSURL *url, NSString *bid) {
-    if (!bid.length) return NO;
-    WXLoadSBS();
-    if (!gSBSLaunchWithURL && !gSBSLaunch) return NO;
-    int err = -1;
-    @try {
-        if (gSBSLaunchWithURL) {
-            err = gSBSLaunchWithURL((__bridge CFStringRef)bid, (__bridge CFURLRef)url,
-                                    (__bridge CFDictionaryRef)@{}, NULL, false);
-        } else {
-            err = gSBSLaunch((__bridge CFStringRef)bid, false);
-        }
-    } @catch (NSException *e) { WXLOG(@"SBS 启动异常 %@", e.reason); }
-    WXLOG(@"SBS 按包名启动 %@ -> %d", bid, err);
-    return err == 0;
 }
 
 static void WXHandleLaunchRequest(void) {
@@ -661,57 +429,6 @@ static void WXPingCallback(CFNotificationCenterRef center, void *observer, CFStr
 
 static void WXDarwinCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     dispatch_async(dispatch_get_main_queue(), ^{ WXHandleLaunchRequest(); });
-}
-
-// SB 侧：接收应用进程的步骤遥测，并处理“代为启动”请求
-static void WXHandleSBLaunchFromPasteboard(void) {
-    NSString *s = nil;
-    @try { s = [UIPasteboard generalPasteboard].string; } @catch (NSException *e) { }
-    if (![s hasPrefix:@"WXREQ\x01"]) { WXLOG(@"SB: 剪贴板里没有启动请求"); return; }
-    NSArray *parts = [s componentsSeparatedByString:@"\x01"];
-    if (parts.count < 3) { WXLOG(@"SB: 请求格式不对 %@", s); return; }
-    NSString *bid = parts[1];
-    NSString *us = parts[2];
-    NSURL *u = us.length ? [NSURL URLWithString:us] : nil;
-    WXLOG(@"SB: 代为启动 bid=%@ url=%@", bid, us);
-    WXLoadSBS();
-    int r1 = -1, r2 = -1, r3 = -1;
-    BOOL helperOk = NO;
-    @try {
-        if (gSBSLaunchWithURL && u) {
-            r1 = gSBSLaunchWithURL((__bridge CFStringRef)bid, (__bridge CFURLRef)u, NULL, NULL, false);
-            WXLOG(@"SB: SBS带链接(空options) r=%d", r1);
-        }
-    } @catch (NSException *e) { WXLOG(@"SB: SBS带链接异常 %@", e.reason); }
-    @try {
-        if (r1 != 0 && gSBSLaunchWithURL && u) {
-            r2 = gSBSLaunchWithURL((__bridge CFStringRef)bid, (__bridge CFURLRef)u,
-                                   (__bridge CFDictionaryRef)@{}, NULL, false);
-            WXLOG(@"SB: SBS带链接(空字典) r=%d", r2);
-        }
-        if (r1 != 0 && r2 != 0 && gSBSLaunch) {
-            r3 = gSBSLaunch((__bridge CFStringRef)bid, false);
-            WXLOG(@"SB: SBS只启动 r=%d", r3);
-        }
-    } @catch (NSException *e) { WXLOG(@"SB: SBS仅启动异常 %@", e.reason); }
-    if (r1 != 0 && r2 != 0 && r3 != 0) {
-        @try { helperOk = WXSBLaunchByBundle(u, bid); } @catch (NSException *e) { WXLOG(@"SB: 外部启动器异常 %@", e.reason); }
-        WXLOG(@"SB: 外部启动器结果=%d", helperOk);
-    }
-    @try {
-        UIPasteboard *pb = [UIPasteboard generalPasteboard];
-        pb.string = [NSString stringWithFormat:@"WXRES\x01sbs=%d\x01sbs2=%d\x01plain=%d\x01helper=%d",
-                     r1, r2, r3, helperOk ? 1 : 0];
-    } @catch (NSException *e) { }
-}
-
-static void WXSBCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
-    dispatch_async(dispatch_get_main_queue(), ^{ WXHandleSBLaunchFromPasteboard(); });
-}
-
-static void WXTelescopeCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
-    NSString *nm = (__bridge NSString *)name;
-    WXLOG(@"应用步骤遥测 %@", [nm stringByReplacingOccurrencesOfString:@"com.fengxin.wxchooser.tel." withString:@""]);
 }
 
 // 只在 SpringBoard 里跑：把系统里跟“启动应用 / 打开 URL”相关的方法名导出，方便定位真正的拦截点
@@ -1008,8 +725,6 @@ static void WXStyleAction(UIAlertAction *a, NSDictionary *cand, NSString *title)
 #pragma mark - 自绘底部菜单（图标与名字整行居中）
 
 @interface WXSheetRowTarget : NSObject
-- (void)onRowTouchDown:(UIButton *)sender;
-- (void)onRowTouchUp:(UIButton *)sender;
 - (void)onRowTap:(UIButton *)sender;
 - (void)onCancelTap:(UIButton *)sender;
 - (void)dismissSheet;
@@ -1031,18 +746,7 @@ static WXSheetRowTarget *gWXSheetTarget = nil;
     if (!c) return;
     [UIView animateWithDuration:0.16 animations:^{ c.alpha = 0.0; } completion:^(BOOL finished) { [c removeFromSuperview]; }];
 }
-- (void)onRowTouchDown:(UIButton *)sender {
-    [UIView animateWithDuration:0.08 animations:^{ sender.alpha = 0.45; }];
-}
-- (void)onRowTouchUp:(UIButton *)sender {
-    [UIView animateWithDuration:0.12 animations:^{ sender.alpha = 1.0; }];
-}
 - (void)onRowTap:(UIButton *)sender {
-    sender.alpha = 1.0;
-    @try {
-        UIImpactFeedbackGenerator *h = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
-        [h prepare]; [h impactOccurred];
-    } @catch (NSException *e) { }
     NSInteger idx = sender.tag;
     NSArray *cands = gWXSheetCands;
     void (^pick)(NSDictionary *) = gWXSheetPick;
@@ -1125,8 +829,6 @@ static BOOL WXShowSheet(UIView *host, NSArray<NSDictionary *> *cands, void (^pic
             row.frame = CGRectMake(0, y, cardW, rowH);
             row.tag = (NSInteger)i;
             [row addTarget:target action:@selector(onRowTap:) forControlEvents:UIControlEventTouchUpInside];
-            [row addTarget:target action:@selector(onRowTouchDown:) forControlEvents:UIControlEventTouchDown];
-            [row addTarget:target action:@selector(onRowTouchUp:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel | UIControlEventTouchDragExit];
 
             UIImage *icon = WXRealIconForBid(cand[@"bid"], cand[@"path"]);
             NSString *nm = cand[@"name"] ?: cand[@"bid"];
@@ -1203,23 +905,6 @@ static void WXRemoveSheetNow(void) {
     if (c) [c removeFromSuperview];
 }
 
-static void WXLaunchingCallback(CFNotificationCenterRef center, void *observer, CFNotificationName name, const void *object, CFDictionaryRef info) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 1.5;
-        gWXDialoging = NO;
-        gWXCooldownUntil = 0;
-        WXLOG(@"收到启动广播，SB 放行 8 秒且不再弹框");
-        WXSBHideOverlay();
-    });
-}
-
-static void WXPostLaunchingNote(void) {
-    @try {
-        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                                             CFSTR("com.fengxin.wxchooser.launching"), NULL, NULL, true);
-    } @catch (NSException *e) { }
-}
-
 static void WXSheetDismissCallback(CFNotificationCenterRef center, void *observer, CFNotificationName name, const void *object, CFDictionaryRef info) {
     dispatch_async(dispatch_get_main_queue(), ^{
         WXRemoveSheetNow();
@@ -1242,165 +927,6 @@ static double WXAppSheetAge(void) {
     } @catch (NSException *e) { return 9999.0; }
 }
 
-static UIWindow *gWXDiagWin = nil;
-
-static void WXShowDiagHUD(NSString *text) {
-    @try {
-        if (gWXDiagWin) { [gWXDiagWin removeFromSuperview]; gWXDiagWin.hidden = YES; gWXDiagWin = nil; }
-        UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        w.windowLevel = UIWindowLevelAlert + 1;
-        w.backgroundColor = [UIColor clearColor];
-        UIViewController *vc = [[UIViewController alloc] init];
-        vc.view.backgroundColor = [UIColor clearColor];
-        UILabel *lab = [[UILabel alloc] initWithFrame:CGRectInset(w.bounds, 24, 0)];
-        lab.numberOfLines = 0;
-        lab.text = text;
-        lab.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
-        lab.textColor = [UIColor whiteColor];
-        lab.textAlignment = NSTextAlignmentCenter;
-        UIView *bg = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w.bounds.size.width - 48, 0)];
-        bg.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.82];
-        bg.layer.cornerRadius = 14;
-        [vc.view addSubview:bg];
-        [vc.view addSubview:lab];
-        lab.frame = CGRectMake(20, 0, w.bounds.size.width - 88, 0);
-        [lab sizeToFit];
-        CGFloat h = lab.bounds.size.height + 36;
-        bg.frame = CGRectMake(24, w.bounds.size.height / 2 - h / 2, w.bounds.size.width - 48, h);
-        lab.frame = CGRectMake(40, bg.frame.origin.y + 18, w.bounds.size.width - 80, lab.bounds.size.height);
-        w.rootViewController = vc;
-        w.hidden = NO;
-        gWXDiagWin = w;
-        WXLOG(@"诊断 HUD 已显示：%@", text);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (gWXDiagWin == w) { w.hidden = YES; gWXDiagWin = nil; }
-        });
-    } @catch (NSException *e) { WXLOG(@"HUD 异常 %@", e.reason); }
-}
-
-@interface WXLaunchRunner : NSObject
-@property (nonatomic, strong) NSURL *url;
-@property (nonatomic, copy) NSDictionary *cand;
-@property (nonatomic, copy) NSDictionary *options;
-@property (nonatomic, copy) void (^completion)(BOOL);
-@property (nonatomic, strong) NSMutableString *steps;
-@property (nonatomic, assign) NSInteger step;
-@property (nonatomic, assign) BOOL done;
-- (void)start;
-@end
-
-static WXLaunchRunner *gWXRunner = nil;
-
-@implementation WXLaunchRunner
-
-- (void)start {
-    self.steps = [NSMutableString string];
-    self.step = 0;
-    self.done = NO;
-    gWXRunner = self;
-    [self next];
-    __weak WXLaunchRunner *ws = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [ws finish:NO];
-    });
-}
-
-- (void)next {
-    if (self.done) return;
-    NSString *bid = self.cand[@"bid"];
-    NSString *scheme = self.cand[@"scheme"];
-    BOOL isWeb = !WXIsWeixinScheme(self.url.scheme ?: @"");
-    BOOL fired = NO;
-    NSString *label = nil;
-    switch (self.step) {
-        case 0:
-            label = @"1 系统SBS+链接";
-            fired = bid.length ? WXLaunchBySBS(self.url, bid) : NO;
-            break;
-        case 1:
-            label = @"2 仅启动App";
-            fired = bid.length ? WXLaunchBySBS(nil, bid) : NO;
-            break;
-        case 2:
-            label = @"3 交SB代启动";
-            fired = WXPostSBLaunch(bid, self.url);
-            break;
-        case 3:
-            if (isWeb) { self.step++; [self next]; return; }
-            label = @"4 改链接";
-            fired = scheme.length ? WXOpenByScheme(self.url, scheme, nil) : NO;
-            break;
-        case 4:
-            label = @"5 系统默认";
-            fired = YES;
-            WXOpenPassthrough(self.url, self.options, nil);
-            break;
-        default:
-            [self finish:NO];
-            return;
-    }
-    self.step++;
-    [self.steps appendFormat:@"%@ 返回%d\n", label, fired];
-    WXLOG(@"启动第%d步 %@ 返回%d", (int)self.step, label, fired);
-    WXTel([NSString stringWithFormat:@"s%d-%d", (int)self.step, fired ? 1 : 0]);
-    __weak WXLaunchRunner *ws = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        WXLaunchRunner *me = ws;
-        if (!me || me.done) return;
-        if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
-            [me.steps appendString:@"→ 已离开当前应用"];
-            [me finish:YES];
-            return;
-        }
-        [me next];
-    });
-}
-
-- (void)finish:(BOOL)ok {
-    if (self.done) return;
-    self.done = YES;
-    NSString *bid = self.cand[@"bid"];
-    WXLOG(@"选择结果 target=%@ url=%@ ok=%d\n%@", bid ?: @"(空)", self.url.absoluteString ?: @"(空)", ok, self.steps);
-    WXTel(ok ? @"ok" : @"fail");
-    if (ok) { gWXBusy = NO; gWXBusyAt = 0; }
-    if (self.completion) self.completion(YES);
-    if (!ok) {
-        WXShowDiagHUD([NSString stringWithFormat:@"没跳转 → %@\n%@", bid ?: @"(无包名)", self.steps]);
-    }
-}
-
-@end
-
-static void WXLaunchChosen(NSURL *url, NSDictionary *cand, NSDictionary *options, void (^completion)(BOOL)) {
-    NSString *bid = cand[@"bid"];
-    NSString *scheme = cand[@"scheme"];
-    BOOL isNative = [bid isEqualToString:@"com.tencent.xin"];
-    WXLOG(@"选择 %@ (%@) 在SB=%d url=%@", cand[@"name"], bid, gWXInSB, url.absoluteString ?: @"(空)");
-
-    // 原生微信：就在当前进程原样打开（1.32 里真正能打开的就是这一下）
-    if (!gWXInSB && isNative) {
-        WXOpenPassthrough(url, options, ^(BOOL ok) {
-            WXLOG(@"原样打开结果=%d", ok);
-            if (!ok && scheme.length) {
-                WXOpenByScheme(url, scheme, ^(BOOL ok2) {
-                    WXLOG(@"改写后打开结果=%d", ok2);
-                    if (completion) completion(YES);
-                });
-                return;
-            }
-            if (completion) completion(YES);
-        });
-        return;
-    }
-
-    // 分身 / SpringBoard 内：交给常驻 root 启动器按包名拉起来
-    NSString *dir = gWXInSB ? @"/var/mobile" : WXAppDocsDir();
-    BOOL posted = WXPostDaemonRequest(bid, url, dir);
-    if (!posted) WXLOG(@"请求文件没写成功，只能先回成功让流程继续");
-    if (!gWXInSB) WXWatchLaunchResult(dir, bid);
-    if (completion) completion(YES);
-}
-
 static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDictionary *options, void (^completion)(BOOL)) {
     UIViewController *top = WXTopViewController();
     if (!top) { WXLOG(@"找不到顶层控制器，直接放行"); completion(YES); return; }
@@ -1413,9 +939,22 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
             }
         }
         BOOL shown = hostWin ? WXShowSheet(hostWin, cands, ^(NSDictionary *cand) {
-                WXLaunchChosen(url, cand, options, completion);
+                BOOL handled = NO;
+                NSString *scheme = cand[@"scheme"];
+                NSString *bid = cand[@"bid"];
+                if (bid.length) handled = WXOpenByBundleID(url, bid, nil);
+                if (!handled && scheme.length) handled = WXOpenByScheme(url, scheme, ^(BOOL ok) {
+                    if (!ok) WXLOG(@"scheme 方式打开失败：%@", scheme);
+                });
+                if (!handled) handled = WXRequestSpringBoardLaunch(url, cand[@"bid"]);
+                if (!handled) handled = WXOpenByBundleID(url, cand[@"bid"], nil);
+                if (!handled) {
+                    WXLOG(@"几种方式都失败，回退系统默认，目标=%@", cand[@"bid"]);
+                    WXOpenPassthrough(url, options, completion);
+                } else if (completion) {
+                    completion(YES);
+                }
             }, ^{
-                gWXBusy = NO; gWXBusyAt = 0;
                 if (completion) completion(NO);
             }) : NO;
         if (shown) {
@@ -1435,7 +974,21 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
     for (NSDictionary *cand in cands) {
         NSString *title = cand[@"name"] ?: cand[@"bid"];
         UIAlertAction *act = [UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            WXLaunchChosen(url, cand, options, completion);
+            BOOL handled = NO;
+            NSString *scheme = cand[@"scheme"];
+            NSString *bid = cand[@"bid"];
+            if (bid.length) handled = WXOpenByBundleID(url, bid, nil);
+            if (!handled && scheme.length) handled = WXOpenByScheme(url, scheme, ^(BOOL ok) {
+                if (!ok) WXLOG(@"scheme 方式打开失败：%@", scheme);
+            });
+            if (!handled) handled = WXRequestSpringBoardLaunch(url, cand[@"bid"]);
+            if (!handled) handled = WXOpenByBundleID(url, cand[@"bid"], nil);
+            if (!handled) {
+                WXLOG(@"几种方式都失败，回退系统默认，目标=%@", cand[@"bid"]);
+                WXOpenPassthrough(url, options, completion);
+            } else if (completion) {
+                completion(YES);
+            }
         }];
         WXStyleAction(act, cand, title);
         [ac addAction:act];
@@ -1452,11 +1005,7 @@ static void WXPresentChooser(NSURL *url, NSArray<NSDictionary *> *cands, NSDicti
 
 // 返回 YES 表示已经由本插件接管（调用方应直接返回成功）
 static BOOL WXTryIntercept(NSURL *url, NSDictionary *options, void (^completion)(BOOL), NSString *entry) {
-    if (gWXBusy) {
-        if (CFAbsoluteTimeGetCurrent() - gWXBusyAt < 0.6) return NO;
-        WXLOG(@"忙碌标记已过期，自动解除");
-        gWXBusy = NO;
-    }
+    if (gWXBusy) return NO;
     NSString *selfBid = WXSelfBundleID();
     BOOL inSpringBoard = [selfBid isEqualToString:@"com.apple.springboard"];
     WXLOG(@"[%@] 入口调用 App=%@ url=%@ opts=%@", entry, selfBid ?: @"(未知)", url.absoluteString ?: @"(无)", options ? [(NSDictionary *)options description] : @"(空)");
@@ -1468,8 +1017,10 @@ static BOOL WXTryIntercept(NSURL *url, NSDictionary *options, void (^completion)
         WXLOG(@"[%@] %@ //%@", entry, scheme.length ? scheme : @"(无)", host);
         if (WXIsSelfWeChat()) return NO;
         if (!WXIsTargetURL(url)) return NO;
-        BOOL webLink = !WXIsWeixinScheme(scheme);
-        if (webLink) WXLOG(@"命中微信 https/Universal Link，同样弹选择框：%@", url.absoluteString);
+        if (!WXIsWeixinScheme(scheme)) {
+            WXLOG(@"★ 命中微信 https 链接（Universal Link），无法强制指定 App，仅记录：%@", url.absoluteString);
+            return NO;
+        }
         NSArray *cands = WXCandidatesForURL(url);
         WXLOG(@"拦截 %@ 候选 %lu 个", url.absoluteString, (unsigned long)cands.count);
         for (NSDictionary *c in cands) WXLOG(@"  候选：%@ %@ scheme=%@ wxScheme=%@", c[@"bid"], c[@"name"], c[@"scheme"] ?: @"(无)", c[@"wxScheme"] ?: @"(无)");
@@ -1496,7 +1047,7 @@ static BOOL (*o_ext_openURL)(id, SEL, NSURL *, void (^)(BOOL)) = NULL;
 static BOOL h_app_openURL_opts(id self, SEL _cmd, NSURL *url, NSDictionary *opts, void (^cb)(BOOL)) {
     if (WXTryIntercept(url, opts, cb, @"UIApplication openURL:options:")) return YES;
     if (!o_app_openURL_opts) return NO;
-    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
+    gWXBusy = YES;
     BOOL r = o_app_openURL_opts(self, _cmd, url, opts, cb);
     gWXBusy = NO;
     return r;
@@ -1505,7 +1056,7 @@ static BOOL h_app_openURL_opts(id self, SEL _cmd, NSURL *url, NSDictionary *opts
 static BOOL h_app_openURL(id self, SEL _cmd, NSURL *url) {
     if (WXTryIntercept(url, @{}, nil, @"UIApplication openURL:")) return YES;
     if (!o_app_openURL) return NO;
-    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
+    gWXBusy = YES;
     BOOL r = o_app_openURL(self, _cmd, url);
     gWXBusy = NO;
     return r;
@@ -1514,7 +1065,7 @@ static BOOL h_app_openURL(id self, SEL _cmd, NSURL *url) {
 static BOOL h_app__openURL_opts(id self, SEL _cmd, NSURL *url, id opts) {
     if (WXTryIntercept(url, [opts isKindOfClass:[NSDictionary class]] ? opts : @{}, nil, @"UIApplication _openURL:options:")) return YES;
     if (!o_app__openURL_opts) return NO;
-    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
+    gWXBusy = YES;
     BOOL r = o_app__openURL_opts(self, _cmd, url, opts);
     gWXBusy = NO;
     return r;
@@ -1523,7 +1074,7 @@ static BOOL h_app__openURL_opts(id self, SEL _cmd, NSURL *url, id opts) {
 static BOOL h_lsw_openURL(id self, SEL _cmd, NSURL *url) {
     if (WXTryIntercept(url, @{}, nil, @"LSWorkspace openURL:")) return YES;
     if (!o_lsw_openURL) return NO;
-    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
+    gWXBusy = YES;
     BOOL r = o_lsw_openURL(self, _cmd, url);
     gWXBusy = NO;
     return r;
@@ -1532,7 +1083,7 @@ static BOOL h_lsw_openURL(id self, SEL _cmd, NSURL *url) {
 static BOOL h_lsw_openURL_opts(id self, SEL _cmd, NSURL *url, id opts) {
     if (WXTryIntercept(url, [opts isKindOfClass:[NSDictionary class]] ? opts : @{}, nil, @"LSWorkspace openURL:withOptions:")) return YES;
     if (!o_lsw_openURL_opts) return NO;
-    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
+    gWXBusy = YES;
     BOOL r = o_lsw_openURL_opts(self, _cmd, url, opts);
     gWXBusy = NO;
     return r;
@@ -1541,7 +1092,7 @@ static BOOL h_lsw_openURL_opts(id self, SEL _cmd, NSURL *url, id opts) {
 static BOOL h_lsw_openSensitive(id self, SEL _cmd, NSURL *url, id opts) {
     if (WXTryIntercept(url, [opts isKindOfClass:[NSDictionary class]] ? opts : @{}, nil, @"LSWorkspace openSensitiveURL:withOptions:")) return YES;
     if (!o_lsw_openSensitive) return NO;
-    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
+    gWXBusy = YES;
     BOOL r = o_lsw_openSensitive(self, _cmd, url, opts);
     gWXBusy = NO;
     return r;
@@ -1550,7 +1101,7 @@ static BOOL h_lsw_openSensitive(id self, SEL _cmd, NSURL *url, id opts) {
 static BOOL h_ext_openURL(id self, SEL _cmd, NSURL *url, void (^cb)(BOOL)) {
     if (WXTryIntercept(url, @{}, cb, @"NSExtensionContext openURL:")) return YES;
     if (!o_ext_openURL) return NO;
-    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
+    gWXBusy = YES;
     BOOL r = o_ext_openURL(self, _cmd, url, cb);
     gWXBusy = NO;
     return r;
@@ -1569,7 +1120,7 @@ static BOOL h_app_canOpenURL(id self, SEL _cmd, NSURL *url) {
 static BOOL h_lsw_openURL_bid(id self, SEL _cmd, NSURL *url, id bid) {
     if (WXTryIntercept(url, @{}, nil, [NSString stringWithFormat:@"LSWorkspace openURL:withBundleIdentifier: %@", bid])) return YES;
     if (!o_lsw_openURL_bid) return NO;
-    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
+    gWXBusy = YES;
     BOOL r = o_lsw_openURL_bid(self, _cmd, url, bid);
     gWXBusy = NO;
     return r;
@@ -1578,7 +1129,7 @@ static BOOL h_lsw_openURL_bid(id self, SEL _cmd, NSURL *url, id bid) {
 static BOOL h_lsw_openURL_bid_unlock(id self, SEL _cmd, NSURL *url, id bid, BOOL allow) {
     if (WXTryIntercept(url, @{}, nil, [NSString stringWithFormat:@"LSWorkspace openURL:withBundleIdentifier:allowUnlock: %@", bid])) return YES;
     if (!o_lsw_openURL_bid_unlock) return NO;
-    gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
+    gWXBusy = YES;
     BOOL r = o_lsw_openURL_bid_unlock(self, _cmd, url, bid, allow);
     gWXBusy = NO;
     return r;
@@ -1627,7 +1178,7 @@ static UIWindow *gWXOverlay = nil;
 static volatile BOOL gWXOverlayVisible = NO;
 static NSString *const kWXGuard = @"/var/mobile/wxchooser.guard";
 static BOOL gWXGuardTripped = NO;
-
+static CFAbsoluteTime gWXSuppressUntil = 0;
 static id gWXPendingReq = nil;
 static id gWXPendingSelf = nil;
 static id gWXPendingValidator = nil;
@@ -1697,8 +1248,8 @@ static void WXLSAsyncOpen(NSString *bid, NSURL *url) {
 static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
     @try {
         if (!bid.length) return NO;
-        gWXBusy = YES; gWXBusyAt = CFAbsoluteTimeGetCurrent();
-        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 1.0;
+        gWXBusy = YES;
+        gWXSuppressUntil = CFAbsoluteTimeGetCurrent() + 14.0;
 
         WXLOG(@"外部启动器接管 bid=%@ url=%@", bid, url.absoluteString ?: @"(无)");
 
@@ -1722,8 +1273,7 @@ static BOOL WXSBLaunchByBundle(NSURL *url, NSString *bid) {
         WXLOG(@"命令文件 %@ 已写=%d", cmdPath, wrote);
 
         const char *path = bin.UTF8String;
-        // --oneshot：只干一次活就退出；常驻模式不带参数，由单独的守护启动
-        char *const argsv[] = { (char *)path, (char *)"--oneshot", NULL };
+        char *const argsv[] = { (char *)path, NULL };
         char *const envv[] = { (char *)"PATH=/usr/bin:/bin:/usr/sbin:/sbin", (char *)"HOME=/var/mobile", NULL };
         pid_t pid = 0;
         int rc = posix_spawn(&pid, path, NULL, NULL, argsv, envv);
@@ -1834,17 +1384,17 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                     NSString *bid = cand[@"bid"];
                     WXLOG(@"用户选择(自绘)：%@ (%@)", cand[@"name"], bid);
                     gWXDialoging = NO;
-                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 0.5;
+                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 2.5;
                     WXSBHideOverlay();
                     NSURL *u2 = url;
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                        WXLOG(@"后台线程请求启动器拉起 %@", bid);
-                        WXPostDaemonRequest(bid, u2, @"/var/mobile");
+                        WXLOG(@"后台线程开始拉起 %@", bid);
+                        WXSBLaunchByBundle(u2, bid);
                     });
                 }, ^{
                     WXLOG(@"用户取消(自绘)");
                     gWXDialoging = NO;
-                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 0.5;
+                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 2.5;
                     WXSBHideOverlay();
                 })) {
                 WXSetGuard(NO);
@@ -1858,12 +1408,12 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                 UIAlertAction *act = [UIAlertAction actionWithTitle:nm style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
                     WXLOG(@"用户选择：%@ (%@)", nm, bid);
                     gWXDialoging = NO;
-                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 0.5;
+                    gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 2.5;
                     WXSBHideOverlay();
                     NSURL *u2 = url;
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                        WXLOG(@"后台线程请求启动器拉起 %@", bid);
-                        WXPostDaemonRequest(bid, u2, @"/var/mobile");
+                        WXLOG(@"后台线程开始拉起 %@", bid);
+                        WXSBLaunchByBundle(u2, bid);
                     });
                 }];
                 WXStyleAction(act, cand, nm);
@@ -1872,7 +1422,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
             [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
                 WXLOG(@"用户取消");
                 gWXDialoging = NO;
-                gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 0.5;
+                gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 2.5;
                 WXSBHideOverlay();
             }]];
             [gWXHostVC presentViewController:ac animated:NO completion:^{
@@ -2092,48 +1642,7 @@ static NSString *WXWeixinURLFromString(NSString *s) {
     return out.length > 6 ? out : nil;
 }
 
-static NSString *kWXSelfMark = @"/var/mobile/wxchooser.selflaunch.plist";
-
-// 这次抬微信的事务，是不是常驻启动器自己发起的？是就放行，别再弹一次框、更别拒绝它
-static BOOL WXSelfLaunchPassThrough(id request) {
-    NSDictionary *m = [NSDictionary dictionaryWithContentsOfFile:kWXSelfMark];
-    if (![m isKindOfClass:[NSDictionary class]]) return NO;
-    NSString *bid = m[@"bid"];
-    double ts = [m[@"ts"] doubleValue];
-    if (!bid.length || ts <= 0) return NO;
-    double age = [[NSDate date] timeIntervalSince1970] - ts;
-    if (age < 0 || age > 10.0) {
-        [[NSFileManager defaultManager] removeItemAtPath:kWXSelfMark error:nil];
-        return NO;
-    }
-    NSString *reqBid = WXBundleFromRequest(request);
-    if (![reqBid isEqualToString:bid]) {
-        int b2 = 400;
-        NSString *sb2 = WXScanForBundleString(request, 0, &b2);
-        if (sb2) reqBid = sb2;
-    }
-    BOOL match = [reqBid isEqualToString:bid];
-    if (!match) {
-        NSString *desc = nil;
-        @try { desc = [request description]; } @catch (NSException *e) {}
-        match = (desc.length && [desc containsString:bid]);
-    }
-    if (!match) return NO;
-    [[NSFileManager defaultManager] removeItemAtPath:kWXSelfMark error:nil];
-    WXLOG(@"  自启动标记匹配（%.1fs 前，%@）", age, bid);
-    return YES;
-}
-
 static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long options, id validator) {
-    @try {
-        if (WXSelfLaunchPassThrough(request)) {
-            WXLOG(@"★ 放行本次自启动事务（启动器发起），不拦不弹");
-            if (o_sbmw_execute) o_sbmw_execute(self, _cmd, request, options, validator);
-            return;
-        }
-    } @catch (NSException *e) {
-        WXLOG(@"自启动判定异常 %@", e.reason);
-    }
     BOOL intercept = NO;
     BOOL shouldShow = NO;
     NSURL *hitURL = nil;
@@ -2184,7 +1693,10 @@ static void h_sbmw_execute(id self, SEL _cmd, id request, unsigned long long opt
                 static CFAbsoluteTime lastHit = 0;
                 CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
                 BOOL tooSoon = (now - lastHit < 1.2);
-                BOOL busyByDialog = (gWXDialoging || now < gWXCooldownUntil);
+                double appAge = WXAppSheetAge();
+                BOOL appHandled = (appAge < 3.0);
+                BOOL busyByDialog = (gWXDialoging || now < gWXCooldownUntil || appHandled);
+                if (appHandled) WXLOG(@"应用内已弹窗（%.1f 秒前），SB 不再重复弹框", appAge);
                 if (busyByDialog) {
                     WXLOG(@"弹框进行中/刚选完，静默拒绝重复请求 url=%@", u.absoluteString ?: @"(无)");
                     if ([request respondsToSelector:NSSelectorFromString(@"declineWithReason:")]) {
@@ -2291,111 +1803,7 @@ static void WXInstallRouterHooks(void) {
     }
 }
 
-#pragma mark - 微信进程内：链接自取（不依赖系统把链接传过来）
-
-static NSString *kWXPullFile = @"/var/mobile/wxchooser.pull.plist";
-
-static CGFloat WXPullAgeLimit(void) { return 40.0; }
-
-// 沙盒里的进程只能读自己的 Documents，所以先看自己容器里那份
-static NSString *WXPullPathForSelf(void) {
-    NSString *docs = WXAppDocsDir();
-    if (docs.length) {
-        NSString *p = [docs stringByAppendingPathComponent:@"wxchooser.pull.plist"];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) return p;
-    }
-    return kWXPullFile;
-}
-
-static NSURL *WXPullURLForSelf(BOOL consume) {
-    NSString *path = WXPullPathForSelf();
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:path];
-    if (![d isKindOfClass:[NSDictionary class]] && ![path isEqualToString:kWXPullFile]) {
-        d = [NSDictionary dictionaryWithContentsOfFile:kWXPullFile];
-        path = kWXPullFile;
-    }
-    if (![d isKindOfClass:[NSDictionary class]]) return nil;
-    NSString *bid = d[@"bid"];
-    NSString *us = d[@"url"];
-    double ts = [d[@"ts"] doubleValue];
-    if (!us.length || ![bid isEqualToString:WXSelfBundleID()]) return nil;
-    double age = [[NSDate date] timeIntervalSince1970] - ts;
-    if (age < 0 || age > WXPullAgeLimit()) return nil;
-    if (consume) [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
-    return [NSURL URLWithString:us];
-}
-
-// 给 scene:openURLContexts: 造个最小可用的壳，微信只读 URL 就够了
-@interface WXFakeURLOptions : NSObject
-@end
-@implementation WXFakeURLOptions
-- (id)sourceApplication { return nil; }
-- (id)annotation { return nil; }
-- (BOOL)openInPlace { return NO; }
-- (BOOL)_openInPlace { return NO; }
-- (id)eventAttribution { return nil; }
-- (NSString *)description { return @"<WXFakeURLOptions>"; }
-@end
-
-@interface WXFakeURLContext : NSObject
-@property (nonatomic, strong) NSURL *URL;
-@end
-@implementation WXFakeURLContext
-- (id)options { return [[WXFakeURLOptions alloc] init]; }
-- (NSString *)description { return [NSString stringWithFormat:@"<WXFakeURLContext %@>", self.URL]; }
-@end
-
-static BOOL gWXPullBusy = NO;
-
-static void WXPullDeliver(NSURL *url) {
-    if (!url || gWXPullBusy) return;
-    gWXPullBusy = YES;
-    WXLOG(@"微信侧自取链接：%@", url.absoluteString);
-    id app = [UIApplication sharedApplication];
-    id del = [app delegate];
-
-    // 1) 老接口：AppDelegate 的 application:openURL:options:
-    SEL s1 = NSSelectorFromString(@"application:openURL:options:");
-    if ([del respondsToSelector:s1]) {
-        WXLOG(@"自取：走 AppDelegate application:openURL:options:");
-        @try {
-            ((BOOL (*)(id, SEL, id, id, id))objc_msgSend)(del, s1, app, url, @{});
-            return;
-        } @catch (NSException *e) { WXLOG(@"自取 AppDelegate 异常 %@", e.reason); }
-    }
-
-    // 2) 场景接口：SceneDelegate 的 scene:openURLContexts:
-    SEL s2 = NSSelectorFromString(@"scene:openURLContexts:");
-    NSArray *scenes = [[app connectedScenes] allObjects];
-    for (id scene in scenes) {
-        id sd = nil;
-        @try { sd = ((id (*)(id, SEL))objc_msgSend)(scene, NSSelectorFromString(@"delegate")); } @catch (NSException *e) {}
-        if (!sd || ![sd respondsToSelector:s2]) continue;
-        WXLOG(@"自取：走 SceneDelegate scene:openURLContexts:");
-        @try {
-            WXFakeURLContext *ctx = [[WXFakeURLContext alloc] init];
-            ctx.URL = url;
-            NSSet *set = [NSSet setWithObject:ctx];
-            ((void (*)(id, SEL, id, id))objc_msgSend)(sd, s2, scene, set);
-            return;
-        } @catch (NSException *e) { WXLOG(@"自取 SceneDelegate 异常 %@", e.reason); }
-    }
-    WXLOG(@"自取：没有可用的入口（delegate=%@ 场景数=%lu）", del ? NSStringFromClass([del class]) : @"(无)", (unsigned long)scenes.count);
-}
-
-static void WXPullTick(void) {
-    NSURL *u = WXPullURLForSelf(YES);
-    if (!u) return;
-    // 稍等一下再送：万一系统自己已经把链接交过来了，让那条路先走完
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        WXPullDeliver(u);
-    });
-}
-
-#pragma mark - 初始化
-
 __attribute__((constructor)) static void WXInit(void) {
-    gWXInSB = [WXSelfBundleID() isEqualToString:@"com.apple.springboard"];
     WXLOG(@"LOADED in %@ (%@)", WXSelfBundleID(), WXIsSelfWeChat() ? @"微信本体" : @"其他进程");
     WXInstallHooks();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
@@ -2417,9 +1825,6 @@ __attribute__((constructor)) static void WXInit(void) {
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                         WXDarwinCallback, CFSTR("com.fengxin.wxchooser.launch"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                        WXLaunchingCallback, CFSTR("com.fengxin.wxchooser.launching"),
-                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         for (NSString *nm in @[@"com.fengxin.wxchooser.loaded.chinaunicom",
                                @"com.fengxin.wxchooser.loaded.umbra",
                                @"com.fengxin.wxchooser.loaded.safariview",
@@ -2430,49 +1835,7 @@ __attribute__((constructor)) static void WXInit(void) {
                                             WXPingCallback, (__bridge CFStringRef)nm,
                                             NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         }
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s1-0"),
-                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s2-0"),
-                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s3-0"),
-                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s4-0"),
-                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s5-0"),
-                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.ok"),
-                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.fail"),
-                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s1-1"),
-                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s2-1"),
-                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s3-1"),
-                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s4-1"),
-                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s5-1"),
-                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                        WXSBCallback, CFSTR("com.fengxin.wxchooser.sblaunch"),
-                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         WXLoadSBS();
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                        WXSBLaunchReqCallback, CFSTR("com.fengxin.wxchooser.launchreq"),
-                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         WXLOG(@"SB: 已注册代办启动监听 + 报到监听");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             WXInstallRouterHooks();
@@ -2487,18 +1850,6 @@ __attribute__((constructor)) static void WXInit(void) {
             gWXBusy = NO;
             gWXDialoging = NO;
         }];
-        if (WXIsSelfWeChat()) {
-            WXLOG(@"微信侧：挂上自取链接监听 %@", WXSelfBundleID());
-            [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
-                                                              object:nil
-                                                               queue:[NSOperationQueue mainQueue]
-                                                          usingBlock:^(NSNotification *n) {
-                WXPullTick();
-            }];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                WXPullTick();
-            });
-        }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             WXPostLoadedPing();
             WXLOG(@"已向 SB 报到：%@", WXSelfBundleID());
