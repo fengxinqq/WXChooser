@@ -417,6 +417,31 @@ static void WXLoadSBS(void) {
     WXLOG(@"SBS 接口：withURL=%@ launch=%@", gSBSLaunchWithURL ? @"有" : @"无", gSBSLaunch ? @"有" : @"无");
 }
 
+static void WXPostNote(NSString *name) {
+    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                         (__bridge CFStringRef)name, NULL, NULL, true);
+}
+
+static void WXTel(NSString *code) {
+    WXLOG(@"遥测 %@", code);
+    WXPostNote([NSString stringWithFormat:@"com.fengxin.wxchooser.tel.%@", code]);
+}
+
+// 通过剪贴板把「目标包名 + 链接」交给 SpringBoard，由 SB 代为启动（SB 有权限，应用没有）
+static BOOL WXPostSBLaunch(NSString *bid, NSURL *url) {
+    if (!bid.length) return NO;
+    @try {
+        UIPasteboard *pb = [UIPasteboard generalPasteboard];
+        pb.string = [NSString stringWithFormat:@"WXREQ\x01%@\x01%@", bid, url.absoluteString ?: @""];
+    } @catch (NSException *e) {
+        WXLOG(@"写剪贴板异常 %@", e.reason);
+        return NO;
+    }
+    WXPostNote(@"com.fengxin.wxchooser.sblaunch");
+    WXLOG(@"已请求 SB 代为启动 bid=%@ url=%@", bid, url.absoluteString);
+    return YES;
+}
+
 static BOOL WXLaunchBySBS(NSURL *url, NSString *bid) {
     if (!bid.length) return NO;
     WXLoadSBS();
@@ -471,6 +496,43 @@ static void WXPingCallback(CFNotificationCenterRef center, void *observer, CFStr
 
 static void WXDarwinCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     dispatch_async(dispatch_get_main_queue(), ^{ WXHandleLaunchRequest(); });
+}
+
+// SB 侧：接收应用进程的步骤遥测，并处理“代为启动”请求
+static void WXHandleSBLaunchFromPasteboard(void) {
+    NSString *s = nil;
+    @try { s = [UIPasteboard generalPasteboard].string; } @catch (NSException *e) { }
+    if (![s hasPrefix:@"WXREQ\x01"]) { WXLOG(@"SB: 剪贴板里没有启动请求"); return; }
+    NSArray *parts = [s componentsSeparatedByString:@"\x01"];
+    if (parts.count < 3) { WXLOG(@"SB: 请求格式不对 %@", s); return; }
+    NSString *bid = parts[1];
+    NSString *us = parts[2];
+    NSURL *u = us.length ? [NSURL URLWithString:us] : nil;
+    WXLOG(@"SB: 代为启动 bid=%@ url=%@", bid, us);
+    WXLoadSBS();
+    int r = -1;
+    @try {
+        if (gSBSLaunchWithURL && u) {
+            CFStringRef eb = NULL;
+            r = gSBSLaunchWithURL((__bridge CFStringRef)bid, (__bridge CFURLRef)u,
+                                  (__bridge CFDictionaryRef)@{}, &eb, false);
+            WXLOG(@"SB: SBS带链接 r=%d err=%@", r, eb ? (__bridge NSString *)eb : @"无");
+            if (eb) CFRelease(eb);
+        }
+        if (r != 0 && gSBSLaunch) {
+            r = gSBSLaunch((__bridge CFStringRef)bid, false);
+            WXLOG(@"SB: SBS只启动 r=%d", r);
+        }
+    } @catch (NSException *e) { WXLOG(@"SB: 代为启动异常 %@", e.reason); }
+}
+
+static void WXSBCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    dispatch_async(dispatch_get_main_queue(), ^{ WXHandleSBLaunchFromPasteboard(); });
+}
+
+static void WXTelescopeCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    NSString *nm = (__bridge NSString *)name;
+    WXLOG(@"应用步骤遥测 %@", [nm stringByReplacingOccurrencesOfString:@"com.fengxin.wxchooser.tel." withString:@""]);
 }
 
 // 只在 SpringBoard 里跑：把系统里跟“启动应用 / 打开 URL”相关的方法名导出，方便定位真正的拦截点
@@ -1073,16 +1135,16 @@ static WXLaunchRunner *gWXRunner = nil;
     NSString *label = nil;
     switch (self.step) {
         case 0:
-            label = @"1 包名+链接";
-            fired = bid.length ? WXOpenByBundleID(self.url, bid, nil) : NO;
-            break;
-        case 1:
-            label = @"2 系统SBS+链接";
+            label = @"1 系统SBS+链接";
             fired = bid.length ? WXLaunchBySBS(self.url, bid) : NO;
             break;
-        case 2:
-            label = @"3 仅启动App";
+        case 1:
+            label = @"2 仅启动App";
             fired = bid.length ? WXLaunchBySBS(nil, bid) : NO;
+            break;
+        case 2:
+            label = @"3 交SB代启动";
+            fired = WXPostSBLaunch(bid, self.url);
             break;
         case 3:
             if (isWeb) { self.step++; [self next]; return; }
@@ -1101,6 +1163,7 @@ static WXLaunchRunner *gWXRunner = nil;
     self.step++;
     [self.steps appendFormat:@"%@ 返回%d\n", label, fired];
     WXLOG(@"启动第%d步 %@ 返回%d", (int)self.step, label, fired);
+    WXTel([NSString stringWithFormat:@"s%d-%d", (int)self.step, fired ? 1 : 0]);
     __weak WXLaunchRunner *ws = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         WXLaunchRunner *me = ws;
@@ -1119,6 +1182,7 @@ static WXLaunchRunner *gWXRunner = nil;
     self.done = YES;
     NSString *bid = self.cand[@"bid"];
     WXLOG(@"选择结果 target=%@ url=%@ ok=%d\n%@", bid ?: @"(空)", self.url.absoluteString ?: @"(空)", ok, self.steps);
+    WXTel(ok ? @"ok" : @"fail");
     if (ok) { gWXBusy = NO; gWXBusyAt = 0; }
     if (self.completion) self.completion(YES);
     if (!ok) {
@@ -2020,6 +2084,45 @@ __attribute__((constructor)) static void WXInit(void) {
                                             WXPingCallback, (__bridge CFStringRef)nm,
                                             NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         }
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s1-0"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s2-0"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s3-0"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s4-0"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s5-0"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.ok"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.fail"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s1-1"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s2-1"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s3-1"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s4-1"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        WXTelescopeCallback, CFSTR("com.fengxin.wxchooser.tel.s5-1"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        WXSBCallback, CFSTR("com.fengxin.wxchooser.sblaunch"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         WXLoadSBS();
         WXLOG(@"SB: 已注册代办启动监听 + 报到监听");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
