@@ -1408,6 +1408,7 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                     WXLOG(@"用户选择(自绘)：%@ (%@)", cand[@"name"], bid);
                     gWXDialoging = NO;
                     gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 1.5;
+                    WXRemoveSheetNow();
                     WXSBHideOverlay();
                     NSURL *u2 = url;
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -1418,13 +1419,14 @@ static void WXSBShowChooser(NSURL *url, NSString *entry, void (^fallback)(void))
                     WXLOG(@"用户取消(自绘)");
                     gWXDialoging = NO;
                     gWXCooldownUntil = CFAbsoluteTimeGetCurrent() + 1.5;
+                    WXRemoveSheetNow();
                     WXSBHideOverlay();
                 })) {
                 WXSetGuard(NO);
                 WXLOG(@"自绘菜单已呈现");
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                     if (gWXSheetContainer) {
-                        WXLOG(@"菜单 10 秒无人操作，自动关闭");
+                        WXLOG(@"菜单 4 秒无人操作，自动关闭");
                         WXRemoveSheetNow();
                         WXSBHideOverlay();
                         gWXDialoging = NO;
@@ -1805,6 +1807,14 @@ static void h_sbmw_execute(__unsafe_unretained id self, SEL _cmd, __unsafe_unret
         if (shouldShow) WXSBShowChooser(hitURL, @"SBMainWorkspace", nil);
         else WXLOG(@"静默拦截已完成，不重复弹框");
         return;
+    }
+    if (gWXOverlayVisible) {
+        WXLOG(@"放行启动，立刻收掉残留菜单");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            WXRemoveSheetNow();
+            WXSBHideOverlay();
+            gWXDialoging = NO;
+        });
     }
     if (o_sbmw_execute) {
         @try { o_sbmw_execute(self, _cmd, request, options, validator); }
