@@ -18,10 +18,10 @@ jobs:
             done
             return 1
           }
-          get https://aka.doubaocdn.com/s/2LYCpipBlf WXChooser.x
-          get https://aka.doubaocdn.com/s/vxcdwRpHV7 control
-          get https://aka.doubaocdn.com/s/Lv2miZeymi Makefile
-          get https://aka.doubaocdn.com/s/FsZvejxTiG WXChooser.plist
+          get https://aka.doubaocdn.com/s/6P0amBLcTE WXChooser.x
+          get https://aka.doubaocdn.com/s/vwARzbqoo2 control
+          get https://aka.doubaocdn.com/s/IhsMyUGgow Makefile
+          get https://aka.doubaocdn.com/s/KMR3hVYt0k WXChooser.plist
       - name: deps
         run: brew install ldid xz dpkg
       - name: theos
@@ -40,4 +40,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          gh release create "w17${GITHUB_RUN_NUMBER}" packages/*.deb --title "w17${GITHUB_RUN_NUMBER}" --notes "1.68 覆盖层改为自建高层窗口" --target main
+          gh release create "w18${GITHUB_RUN_NUMBER}" packages/*.deb --title "w18${GITHUB_RUN_NUMBER}" --notes "1.69 拉起改用系统 openURL" --target main
