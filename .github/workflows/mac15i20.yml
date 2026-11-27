@@ -18,10 +18,10 @@ jobs:
             done
             return 1
           }
-          get https://aka.doubaocdn.com/s/ZniPShzMAk WXChooser.x
-          get https://aka.doubaocdn.com/s/KC9wgdMkbp control
-          get https://aka.doubaocdn.com/s/HfzxxUaDuV Makefile
-          get https://aka.doubaocdn.com/s/gxupQnOJmc WXChooser.plist
+          get https://aka.doubaocdn.com/s/50a8IfGi82 WXChooser.x
+          get https://aka.doubaocdn.com/s/u21ftoE3MV control
+          get https://aka.doubaocdn.com/s/St7YionItq Makefile
+          get https://aka.doubaocdn.com/s/XLRGfPtq8d WXChooser.plist
       - name: deps
         run: brew install ldid xz dpkg
       - name: theos
@@ -40,4 +40,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          gh release create "w15${GITHUB_RUN_NUMBER}" packages/*.deb --title "w15${GITHUB_RUN_NUMBER}" --notes "1.66 恢复1.64原始注入名单(含联通)" --target main
+          gh release create "w16${GITHUB_RUN_NUMBER}" packages/*.deb --title "w16${GITHUB_RUN_NUMBER}" --notes "1.67 修QQ登录菜单被自己扫掉" --target main
