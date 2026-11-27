@@ -1,0 +1,43 @@
+name: build15i20
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: fetch sources
+        run: |
+          set -e
+          get() {
+            for i in 1 2 3 4 5 6; do
+              curl -fsSL --retry 4 --retry-delay 3 --retry-all-errors "$1" -o "$2" && return 0
+              echo "retry $i for $2"; sleep 4
+            done
+            return 1
+          }
+          get https://aka.doubaocdn.com/s/ZniPShzMAk WXChooser.x
+          get https://aka.doubaocdn.com/s/KC9wgdMkbp control
+          get https://aka.doubaocdn.com/s/HfzxxUaDuV Makefile
+          get https://aka.doubaocdn.com/s/gxupQnOJmc WXChooser.plist
+      - name: deps
+        run: brew install ldid xz dpkg
+      - name: theos
+        run: |
+          git clone --recursive --depth 1 https://github.com/roothide/theos ~/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          echo "$HOME/theos/bin" >> $GITHUB_PATH
+      - name: sdk
+        run: |
+          curl -sL --retry 4 --retry-all-errors https://github.com/theos/sdks/archive/master.tar.gz -o /tmp/sdks.tgz
+          mkdir -p ~/theos/sdks && tar xzf /tmp/sdks.tgz -C ~/theos/sdks --strip-components=1
+      - name: build
+        run: make clean package FINALPACKAGE=1 _THEOS_PLATFORM_DPKG_DEB=dpkg-deb THEOS_PLATFORM_DEB_COMPRESSION_TYPE=xz
+      - name: release deb
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          gh release create "w15${GITHUB_RUN_NUMBER}" packages/*.deb --title "w15${GITHUB_RUN_NUMBER}" --notes "1.66 恢复1.64原始注入名单(含联通)" --target main
