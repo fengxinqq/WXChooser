@@ -18,10 +18,10 @@ jobs:
             done
             return 1
           }
-          get https://aka.doubaocdn.com/s/6P0amBLcTE WXChooser.x
-          get https://aka.doubaocdn.com/s/vwARzbqoo2 control
-          get https://aka.doubaocdn.com/s/IhsMyUGgow Makefile
-          get https://aka.doubaocdn.com/s/KMR3hVYt0k WXChooser.plist
+          get https://aka.doubaocdn.com/s/uScC8z601U WXChooser.x
+          get https://aka.doubaocdn.com/s/bv5VbSnykP control
+          get https://aka.doubaocdn.com/s/8l7cTGPU5J Makefile
+          get https://aka.doubaocdn.com/s/pLTK6BdpGk WXChooser.plist
       - name: deps
         run: brew install ldid xz dpkg
       - name: theos
@@ -40,4 +40,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          gh release create "w18${GITHUB_RUN_NUMBER}" packages/*.deb --title "w18${GITHUB_RUN_NUMBER}" --notes "1.69 拉起改用系统 openURL" --target main
+          gh release create "w19${GITHUB_RUN_NUMBER}" packages/*.deb --title "w19${GITHUB_RUN_NUMBER}" --notes "1.70 拉起接口探测" --target main
