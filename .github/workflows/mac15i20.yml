@@ -18,10 +18,10 @@ jobs:
             done
             return 1
           }
-          get https://aka.doubaocdn.com/s/TUgw6qO5kR WXChooser.x
-          get https://aka.doubaocdn.com/s/5864ijORj9 control
-          get https://aka.doubaocdn.com/s/1hY7cpmxfi Makefile
-          get https://aka.doubaocdn.com/s/VvhJgabDik WXChooser.plist
+          get https://aka.doubaocdn.com/s/bqquAxU2mZ WXChooser.x
+          get https://aka.doubaocdn.com/s/JxlHcCGDsU control
+          get https://aka.doubaocdn.com/s/EmU7ViM2Pl Makefile
+          get https://aka.doubaocdn.com/s/EkhV2hzSTg WXChooser.plist
       - name: deps
         run: brew install ldid xz dpkg
       - name: theos
@@ -40,4 +40,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          gh release create "w114${GITHUB_RUN_NUMBER}" packages/*.deb --title "w114${GITHUB_RUN_NUMBER}" --notes "1.75 取样诊断" --target main
+          gh release create "w115${GITHUB_RUN_NUMBER}" packages/*.deb --title "w115${GITHUB_RUN_NUMBER}" --notes "1.76 撤回取样" --target main
