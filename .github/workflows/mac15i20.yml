@@ -18,10 +18,10 @@ jobs:
             done
             return 1
           }
-          get https://aka.doubaocdn.com/s/CxhJl1O7nd WXChooser.x
-          get https://aka.doubaocdn.com/s/jy0DItVfP5 control
-          get https://aka.doubaocdn.com/s/vyosMpMJWT Makefile
-          get https://aka.doubaocdn.com/s/OkNR2Za3pz WXChooser.plist
+          get https://aka.doubaocdn.com/s/wZGyFCU7QB WXChooser.x
+          get https://aka.doubaocdn.com/s/WB2C7mhKaV control
+          get https://aka.doubaocdn.com/s/scajHyU5dL Makefile
+          get https://aka.doubaocdn.com/s/NrjeZydJtf WXChooser.plist
       - name: deps
         run: brew install ldid xz dpkg
       - name: theos
@@ -40,4 +40,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          gh release create "w112${GITHUB_RUN_NUMBER}" packages/*.deb --title "w112${GITHUB_RUN_NUMBER}" --notes "1.73 FBS 选项对象" --target main
+          gh release create "w113${GITHUB_RUN_NUMBER}" packages/*.deb --title "w113${GITHUB_RUN_NUMBER}" --notes "1.74 事务取真实链接" --target main
