@@ -18,10 +18,10 @@ jobs:
             done
             return 1
           }
-          get https://aka.doubaocdn.com/s/SMOsb4JJbx WXChooser.x
-          get https://aka.doubaocdn.com/s/Q6lv2MUZ4c control
-          get https://aka.doubaocdn.com/s/ZVlUyUs93Q Makefile
-          get https://aka.doubaocdn.com/s/aVAs27RVD7 WXChooser.plist
+          get https://aka.doubaocdn.com/s/USDJLrONY0 WXChooser.x
+          get https://aka.doubaocdn.com/s/9njVUDU3J2 control
+          get https://aka.doubaocdn.com/s/IcS7y5ye6X Makefile
+          get https://aka.doubaocdn.com/s/9kL9QpsTNC WXChooser.plist
       - name: deps
         run: brew install ldid xz dpkg
       - name: theos
@@ -40,4 +40,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          gh release create "w110${GITHUB_RUN_NUMBER}" packages/*.deb --title "w110${GITHUB_RUN_NUMBER}" --notes "1.71 FBS 按包名+载荷打开" --target main
+          gh release create "w111${GITHUB_RUN_NUMBER}" packages/*.deb --title "w111${GITHUB_RUN_NUMBER}" --notes "1.72 SBS 按包名启动" --target main
